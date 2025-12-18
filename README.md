@@ -1,8 +1,8 @@
-# SweepzaAppScript v2.4
+# SweepzaAppScript v2.5
 
 **Production-ready sweepstakes data pipeline for Google Apps Script**
 
-Automates the complete workflow from Octoparse CSV imports to Wix-ready CMS exports, with LLM enrichment, validation gates, and comprehensive observability.
+Automates the complete workflow from Octoparse CSV imports to Wix-ready CMS exports, with LLM enrichment, validation gates, comprehensive observability, **and financial tracking**.
 
 ---
 
@@ -77,6 +77,7 @@ See [DEPLOYMENT_CHECKLIST.md](DEPLOYMENT_CHECKLIST.md) for complete step-by-step
 - **Run History**: Per-run metrics and timing
 - **Delete Audit**: Full record of all removed rows with reasons
 - **Master Export**: Final Wix-ready output
+- **LLM Cost Tracking** ⭐NEW: Token usage and cost estimates per run
 
 ### Pipeline Stages
 
@@ -146,6 +147,9 @@ Octoparse CSV → Google Sheets (Freebie_Guy)
 5. **Error boundaries**: Master rewrite wrapped in try-catch
 6. **Dry run mode**: Test changes without writes
 7. **Audit trail**: Every deletion logged with reason, entry_link, dates
+8. **Daily backups** ⭐NEW: Automatic Master sheet snapshots before destructive ops
+9. **Email alerts** ⭐NEW: Operator notifications on critical failures
+10. **Cost tracking** ⭐NEW: LLM token usage and spend monitoring
 
 ---
 
@@ -215,6 +219,13 @@ Common issues:
 
 ## 🔄 Updates
 
+**v2.5** (2025-12-18):
+- **NEW**: LLM cost tracking (monitor OpenAI spending)
+- **NEW**: Email notifications (proactive error alerts)
+- **NEW**: Automatic daily backups (disaster recovery)
+- **NEW**: Feature enhancement roadmap (13 additional features identified)
+- All features opt-in via feature flags (zero breaking changes)
+
 **v2.4** (2025-12-18):
 - Added Master rewrite error handling
 - Added continuation trigger cleanup on errors
@@ -245,4 +256,6 @@ For issues or questions, check:
 
 ---
 
-**Status**: ✅ Production-ready | Validated 2025-12-18
+**Status**: ✅ Production-ready | v2.5 Released 2025-12-18  
+**What's New**: LLM cost tracking, email notifications, daily backups  
+**Roadmap**: See [FEATURE_ENHANCEMENTS.md](FEATURE_ENHANCEMENTS.md) for 10 additional planned features
