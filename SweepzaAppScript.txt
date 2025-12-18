@@ -133,8 +133,15 @@ function sweepzaPipeline_() {
     const master = ensureMasterSheet_(ss, adjust);
     validateMasterHeadersOrThrow_(master, adjust);
 
+    // Ensure Source Map is populated (critical for first run without setup)
+    const smapLastRow = sourceMap.getLastRow();
+    if (smapLastRow < 2) {
+      refreshSourceMap_(ss, adjust);
+      log_(logSheet, "INFO", "BOOTSTRAP", "", "Source Map was empty; refreshed automatically.");
+    }
+
     // Settings from Control + Adjust ops
-    const settings = readControlSettings_(control, sourceMap, adjust);
+    const settings = readControlSettings_(control, sourceMap, adjust, logSheet);
     RUN.settings = settings;
 
     log_(logSheet, "INFO", "PIPELINE", "", `=== RUN START ${RUN.runId} ===`);
@@ -237,7 +244,7 @@ function ensureControlSheet_(ss) {
   return sh;
 }
 
-function readControlSettings_(controlSheet, sourceMapSheet, adjust) {
+function readControlSettings_(controlSheet, sourceMapSheet, adjust, logSheet) {
   const deleteExpired = toBool_(controlSheet.getRange("B2").getValue());
   const enableMasterQACheck = toBool_(controlSheet.getRange("B3").getValue());
   const dryRun = toBool_(controlSheet.getRange("B4").getValue());
@@ -259,6 +266,7 @@ function readControlSettings_(controlSheet, sourceMapSheet, adjust) {
     if (fg) {
       autoEnableInSourceMap_("Freebie_Guy");
       sourceSheets = ["Freebie_Guy"];
+      log_(logSheet, "INFO", "CONTROL", "", "Auto-enabled Freebie_Guy (no source sheets were enabled in Source Map)");
     }
   }
 
