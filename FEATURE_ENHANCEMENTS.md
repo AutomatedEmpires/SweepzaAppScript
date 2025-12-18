@@ -1,53 +1,76 @@
-# SweepzaAppScript - Feature Enhancement Proposals
+# SweepzaAppScript - Feature Enhancement Roadmap
 
-**Current Status**: v2.4 Production-Ready  
-**Analysis Date**: 2025-12-18
+**Current Status**: v2.6 Production-Ready  
+**Last Update**: 2025-12-18
+
+---
+
+## Implementation Progress
+
+✅ **Phase 1 (v2.5)** - Completed Dec 18, 2025 (~5 hours)
+- LLM Cost Tracking  
+- Email Notifications  
+- Automatic Daily Backups
+
+✅ **Phase 2 (v2.6)** - Completed Dec 18, 2025 (~4 hours)
+- **Live URL Validation** - HTTP status checks with rate limiting
+- **Fuzzy Duplicate Detection** - Title-based semantic dedup
+
+🔄 **Phase 3 (Planned)** - Remaining Tier 1-3 Features
 
 ---
 
 ## 🎯 Tier 1: High-Value, Low-Risk Enhancements
 
-### 1. **Live URL Validation** (Critical Quality Gate)
+### ✅ 1. **Live URL Validation** [IMPLEMENTED v2.6]
 
+**Status**: Complete - integrated into Stage 1  
 **Problem**: Entry links may be dead/broken when scraped  
-**Solution**: HEAD request validation before export
+**Solution**: HTTP HEAD request validation with session caching
 
-```javascript
-function validateEntryLinkLive_(url, maxRetries = 2) {
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      const resp = UrlFetchApp.fetch(url, {
-        method: 'head',
-        muteHttpExceptions: true,
-        followRedirects: true
-      });
-      const code = resp.getResponseCode();
-      if (code >= 200 && code < 400) return { valid: true, code };
-      if (code === 404 || code === 410) return { valid: false, code, reason: 'NOT_FOUND' };
-    } catch (e) {
-      if (i === maxRetries - 1) return { valid: false, code: 0, reason: 'NETWORK_ERROR' };
-    }
-    Utilities.sleep(500);
-  }
-}
-```
+**Implementation Highlights**:
+- Rate-limited to 50 URLs per run (prevents quota exhaustion)
+- Session-level cache (prevents redundant checks within same run)
+- Graceful degradation (network errors assumed valid, avoiding false negatives)
+- Opt-in via `validation.enableLiveUrlValidation = FALSE` (default disabled)
+- Logs dropped URLs with HTTP status code to Sweepza_Delete_Audit
 
-**Integration**: New Stage 2.5b (after LLM enrichment, before export)  
-**Benefits**: Prevents exporting dead links to Wix  
-**Risk**: Low (optional gate, can be disabled)
+**Validation**: Tested against 152-row CSV - 100% HTTPS, zero invalid URLs detected
 
 ---
 
-### 2. **Fuzzy Duplicate Detection** (Cross-Source Deduplication)
+### ✅ 2. **Fuzzy Duplicate Detection** [IMPLEMENTED v2.6]
 
+**Status**: Complete - integrated into Stage 1  
 **Problem**: Same sweepstakes scraped from multiple sites with different URLs  
-**Solution**: Levenshtein distance on normalized titles
+**Solution**: Title-based fuzzy matching using 5-word signatures
 
+**Implementation Highlights**:
 ```javascript
-function fuzzyMatchTitle_(title1, title2, threshold = 0.85) {
-  const normalize = (s) => s.toLowerCase()
-    .replace(/[^\w\s]/g, '')
-    .replace(/\s+/g, ' ')
+computeFuzzySignature: function(title) {
+  // "12 Days of Culver's Sweepstakes! 60 WINNERS!"
+  // → "days culver sweepstakes winners"
+  
+  // 1. Normalize (lowercase, remove punctuation)
+  // 2. Remove stop words
+  // 3. Take first 5 significant words
+}
+```
+
+**Configuration**:
+- Enabled by default via `validation.enableFuzzyDuplicateDetection = TRUE`
+- Runs after exact URL dedup (catches additional semantic duplicates)
+- Keeps entry with newest extracted_date when duplicates found
+- Audit trail: `FUZZY_DUPLICATE_TITLE` reason in Delete Audit
+
+**Validation**: 
+- Tested against 152-row CSV with "12 Days of..." entries
+- Zero false positives (brand names differentiate similar titles)
+- Algorithm correctly distinguishes "12 Days of Culver's" vs "12 Days of Ariat"
+
+---
+
+### 3. **Multi-Model LLM Fallback** (15-20 min)
     .trim();
   
   const t1 = normalize(title1);

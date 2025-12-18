@@ -1,9 +1,19 @@
 /****************************************************
- * SWEEPZA MASTER SCRIPT v2.4 (Single-file, copy/paste)
+ * SWEEPZA MASTER SCRIPT v2.6 (Single-file, copy/paste)
  * Public entrypoints ONLY:
  *   1) sweepzaSetup()
  *   2) sweepzaPipeline()
  *
+ * v2.6 upgrades:
+ * - Live URL Validation (rate-limited to 50/run, checks HTTP status)
+ * - Fuzzy Duplicate Detection (title-based semantic dedup)
+ * - Validation controls in Adjust sheet
+ * 
+ * v2.5 upgrades:
+ * - LLM cost tracking (token usage & cost estimation)
+ * - Email notifications for critical errors
+ * - Automatic daily backups of Master sheet
+ * 
  * v2.4 upgrades (no omissions):
  * - Full self-bootstrap: works when only Freebie_Guy exists
  * - Adjust sheet self-repair: creates required headers/tables if missing
@@ -43,7 +53,9 @@ const CONFIG = {
 
   LIMITS: {
     LOCK_TIMEOUT_MS: 25000,
-    MAX_RUNTIME_MS: 5.7 * 60 * 1000
+    MAX_RUNTIME_MS: 5.7 * 60 * 1000,
+    URL_VALIDATION_TIMEOUT_MS: 5000,
+    URL_VALIDATION_MAX_PER_RUN: 50
   },
 
   LLM_COSTS: {
@@ -499,7 +511,11 @@ function writeAdjustTemplate_(sh, startRow) {
     ["ops","enableEmailNotifications","FALSE","","Send email on critical errors"],
     ["ops","operatorEmail","","","Email address for notifications"],
     ["ops","enableDailyBackups","TRUE","","Auto-backup Master sheet daily"],
-    ["ops","enableLlmCostTracking","TRUE","","Track LLM token usage and costs"]
+    ["ops","enableLlmCostTracking","TRUE","","Track LLM token usage and costs"],
+    
+    // Phase 2 Enhancements (v2.6) - Live URL Validation & Fuzzy Dedup
+    ["validation","enableLiveUrlValidation","FALSE","","Validate URLs are reachable (rate-limited to 50/run)"],
+    ["validation","enableFuzzyDuplicateDetection","TRUE","","Detect semantic duplicates by title similarity"]
   ];
   sh.getRange(r, 1, kv.length, 5).setValues(kv); r += kv.length + 2;
 
@@ -1033,6 +1049,44 @@ function stage1_normalizeDedupeExpire_(sourceSheets, logSheet, deleteAuditSheet,
 
       RUN.counts.normalized++;
     }
+    
+    // Fuzzy duplicate detection (after exact URL dedup)
+    const bestByFuzzy = new Map();
+    const fuzzyEnabled = toBool2_(adjust?.validation?.enableFuzzyDuplicateDetection);
+    
+    if (fuzzyEnabled) {
+      for (let i = 0; i < values.length; i++) {
+        const row = values[i];
+        const entry = String(row[idx.entryLink] || "").trim();
+        if (!entry) continue;
+        
+        const key = entry.toLowerCase();
+        if (!bestByEntry.has(key) || bestByEntry.get(key).rowIndex !== i) continue; // Skip if already marked as exact dup
+        
+        const title = idx.title > -1 ? String(row[idx.title] || "").trim() : "";
+        if (!title) continue;
+        
+        const fuzzyKey = DataNormalizer.computeFuzzySignature(title);
+        if (!fuzzyKey) continue;
+        
+        const extractedEpoch = (idx.extractedDateEpoch > -1) ? Number(row[idx.extractedDateEpoch] || -1) : -1;
+        
+        if (!bestByFuzzy.has(fuzzyKey)) {
+          bestByFuzzy.set(fuzzyKey, { rowIndex: i, extractedEpoch, entry });
+        } else {
+          const cur = bestByFuzzy.get(fuzzyKey);
+          if (extractedEpoch > cur.extractedEpoch || (cur.extractedEpoch < 0 && extractedEpoch < 0 && i > cur.rowIndex)) {
+            bestByFuzzy.set(fuzzyKey, { rowIndex: i, extractedEpoch, entry });
+          }
+        }
+      }
+    }
+    
+    // Live URL validation (rate-limited)
+    let urlValidationCount = 0;
+    const urlValidationEnabled = toBool2_(adjust?.validation?.enableLiveUrlValidation);
+    const urlValidationMax = CONFIG.LIMITS.URL_VALIDATION_MAX_PER_RUN || 50;
+    }
 
     const kept = [];
     for (let i = 0; i < values.length; i++) {
@@ -1055,6 +1109,33 @@ function stage1_normalizeDedupeExpire_(sourceSheets, logSheet, deleteAuditSheet,
         audit_(sheet.getName(), sheetRowNumber, "DUPLICATE_ENTRY_LINK", entry, safeCell_(row, idx.endDate), safeCell_(row, idx.endDateNorm), safeCell_(row, idx.endDateEpoch), "Duplicate; kept best by extracted date");
         log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, "Dropped: duplicate Entry_Link");
         continue;
+      }
+      
+      // Fuzzy duplicate check (title-based)
+      if (fuzzyEnabled) {
+        const title = idx.title > -1 ? String(row[idx.title] || "").trim() : "";
+        if (title) {
+          const fuzzyKey = DataNormalizer.computeFuzzySignature(title);
+          if (fuzzyKey && bestByFuzzy.has(fuzzyKey) && bestByFuzzy.get(fuzzyKey).rowIndex !== i) {
+            RUN.counts.deduped++;
+            audit_(sheet.getName(), sheetRowNumber, "FUZZY_DUPLICATE_TITLE", entry, safeCell_(row, idx.endDate), safeCell_(row, idx.endDateNorm), safeCell_(row, idx.endDateEpoch), `Fuzzy duplicate by title; kept ${bestByFuzzy.get(fuzzyKey).entry}`);
+            log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, "Dropped: fuzzy duplicate (similar title)");
+            continue;
+          }
+        }
+      }
+      
+      // Live URL validation (rate-limited per run)
+      if (urlValidationEnabled && urlValidationCount < urlValidationMax) {
+        const validation = DataNormalizer.validateUrlLive(entry, adjust);
+        urlValidationCount++;
+        
+        if (!validation.valid) {
+          RUN.counts.invalidUrlDropped++;
+          audit_(sheet.getName(), sheetRowNumber, "URL_VALIDATION_FAILED", entry, safeCell_(row, idx.endDate), safeCell_(row, idx.endDateNorm), safeCell_(row, idx.endDateEpoch), `HTTP ${validation.status || 'error'}: URL unreachable`);
+          log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, `Dropped: URL validation failed (${validation.status})`);
+          continue;
+        }
       }
 
       const endEpoch = (idx.endDateEpoch > -1) ? Number(row[idx.endDateEpoch] || "") : NaN;
@@ -1689,10 +1770,73 @@ const DateUtils = {
  * ===================================================================== */
 
 const DataNormalizer = {
+  _urlValidationCache: {},
+  
   isHttpUrl: function(s) {
     if (!s || typeof s !== "string") return false;
     const t = s.trim().toLowerCase();
     return t.startsWith("http://") || t.startsWith("https://");
+  },
+  
+  validateUrlLive: function(url, adjust) {
+    // Check cache first (session-level)
+    if (this._urlValidationCache[url] !== undefined) {
+      return this._urlValidationCache[url];
+    }
+    
+    const enabled = toBool2_(adjust?.validation?.enableLiveUrlValidation);
+    if (!enabled) {
+      this._urlValidationCache[url] = { valid: true, cached: true };
+      return this._urlValidationCache[url];
+    }
+    
+    try {
+      const options = {
+        method: "get",
+        muteHttpExceptions: true,
+        followRedirects: true,
+        validateHttpsCertificates: false,
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; SweepzaBot/1.0)" }
+      };
+      
+      const response = UrlFetchApp.fetch(url, options);
+      const status = response.getResponseCode();
+      const valid = status >= 200 && status < 400;
+      
+      this._urlValidationCache[url] = { 
+        valid: valid, 
+        status: status, 
+        cached: false,
+        checkedAt: new Date().toISOString()
+      };
+      
+      return this._urlValidationCache[url];
+    } catch (e) {
+      // Network errors, timeouts = assume valid (avoid false negatives)
+      this._urlValidationCache[url] = { 
+        valid: true, 
+        error: String(e).substring(0, 100),
+        cached: false 
+      };
+      return this._urlValidationCache[url];
+    }
+  },
+  
+  computeFuzzySignature: function(title) {
+    if (!title || typeof title !== "string") return "";
+    
+    // Normalize: lowercase, remove punctuation, collapse whitespace
+    let normalized = title.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    
+    // Remove common stop words
+    const stopWords = ["the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by"];
+    const words = normalized.split(" ").filter(w => w.length > 2 && !stopWords.includes(w));
+    
+    // Take first 5 significant words as signature
+    return words.slice(0, 5).join(" ");
   },
   normalizeUrl: function(v) {
     if (!v || typeof v !== "string") return "";

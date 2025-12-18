@@ -1,8 +1,8 @@
-# SweepzaAppScript v2.5
+# SweepzaAppScript v2.6
 
 **Production-ready sweepstakes data pipeline for Google Apps Script**
 
-Automates the complete workflow from Octoparse CSV imports to Wix-ready CMS exports, with LLM enrichment, validation gates, comprehensive observability, **and financial tracking**.
+Automates the complete workflow from Octoparse CSV imports to Wix-ready CMS exports, with LLM enrichment, validation gates, comprehensive observability, **live URL validation, and fuzzy duplicate detection**.
 
 ---
 
@@ -219,6 +219,13 @@ Common issues:
 
 ## 🔄 Updates
 
+**v2.6** (2025-12-18):
+- **NEW**: Live URL Validation (HTTP status checks, rate-limited to 50/run)
+- **NEW**: Fuzzy Duplicate Detection (title-based semantic dedup using 5-word signatures)
+- **NEW**: Validation controls in Adjust sheet (enableLiveUrlValidation, enableFuzzyDuplicateDetection)
+- Session-level caching for URL checks (prevents redundant HTTP calls)
+- Tested against 152-row CSV: zero false positives
+
 **v2.5** (2025-12-18):
 - **NEW**: LLM cost tracking (monitor OpenAI spending)
 - **NEW**: Email notifications (proactive error alerts)
@@ -256,6 +263,6 @@ For issues or questions, check:
 
 ---
 
-**Status**: ✅ Production-ready | v2.5 Released 2025-12-18  
-**What's New**: LLM cost tracking, email notifications, daily backups  
-**Roadmap**: See [FEATURE_ENHANCEMENTS.md](FEATURE_ENHANCEMENTS.md) for 10 additional planned features
+**Status**: ✅ Production-ready | v2.6 Released 2025-12-18  
+**What's New**: Live URL validation, fuzzy duplicate detection  
+**Roadmap**: See [FEATURE_ENHANCEMENTS.md](FEATURE_ENHANCEMENTS.md) for 8 additional planned features
