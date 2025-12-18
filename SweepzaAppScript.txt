@@ -207,6 +207,7 @@ function sweepzaPipeline_() {
     log_(logSheet, "ERROR", "PIPELINE", "", `FATAL ${RUN.runId}: ${RUN.error}`);
     flushLogs_(logSheet);
     flushAudit_(deleteSheet);
+    clearContinuationTrigger_();
     throw e;
   } finally {
     lock.releaseLock();
@@ -1438,8 +1439,13 @@ function stage4_masterHygiene_(masterSheet, logSheet, deleteAuditSheet, adjust, 
   }
 
   if (!dryRun) {
-    masterSheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
-    if (kept.length) masterSheet.getRange(2, 1, kept.length, lastCol).setValues(kept);
+    try {
+      masterSheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
+      if (kept.length) masterSheet.getRange(2, 1, kept.length, lastCol).setValues(kept);
+    } catch (e) {
+      log_(logSheet, "ERROR", masterSheet.getName(), "", "CRITICAL: Master rewrite failed after clear: " + String(e));
+      throw new Error("Master hygiene failed during rewrite. Data may be lost. Manual recovery required.");
+    }
   } else {
     log_(logSheet, "INFO", masterSheet.getName(), "", `[DRY_RUN] Would rewrite master with ${kept.length} rows`);
   }
