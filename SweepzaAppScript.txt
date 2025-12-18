@@ -30,7 +30,8 @@ const CONFIG = {
     LOG: "Sweepza_Logs",
     RUNS: "Sweepza_Run_History",
     DELETE_AUDIT: "Sweepza_Delete_Audit",
-    MASTER: "Master_Export_Sheet"
+    MASTER: "Master_Export_Sheet",
+    LLM_COST: "Sweepza_LLM_Cost_Tracking"
   },
 
   PROPS: {
@@ -43,6 +44,12 @@ const CONFIG = {
   LIMITS: {
     LOCK_TIMEOUT_MS: 25000,
     MAX_RUNTIME_MS: 5.7 * 60 * 1000
+  },
+
+  LLM_COSTS: {
+    "gpt-4o": { input: 0.0025, output: 0.010 },
+    "gpt-4o-mini": { input: 0.00015, output: 0.0006 },
+    "gpt-3.5-turbo": { input: 0.0005, output: 0.0015 }
   }
 };
 
@@ -208,6 +215,13 @@ function sweepzaPipeline_() {
     flushLogs_(logSheet);
     flushAudit_(deleteSheet);
     clearContinuationTrigger_();
+    
+    // Phase 1 Enhancement: Email notification on errors
+    try {
+      const adjust = readAdjustConfigSafe_(ss);
+      notifyOperator_(adjust, "CRITICAL", "Pipeline Failed", RUN.error);
+    } catch (_) {}
+    
     throw e;
   } finally {
     lock.releaseLock();
@@ -479,7 +493,13 @@ function writeAdjustTemplate_(sh, startRow) {
     ["ops","maxLongDescChars","900","","Trim if too long"],
     ["ops","requireSeoAltText","TRUE","","Require image_alt non-empty (LLM will generate fallback)"],
     ["ops","exportRequiresEndDate","TRUE","","If TRUE, skips export if end_date missing"],
-    ["ops","exportRequiresImage","FALSE","","If TRUE, skips export if image missing"]
+    ["ops","exportRequiresImage","FALSE","","If TRUE, skips export if image missing"],
+    
+    // Phase 1 Enhancements (v2.5)
+    ["ops","enableEmailNotifications","FALSE","","Send email on critical errors"],
+    ["ops","operatorEmail","","","Email address for notifications"],
+    ["ops","enableDailyBackups","TRUE","","Auto-backup Master sheet daily"],
+    ["ops","enableLlmCostTracking","TRUE","","Track LLM token usage and costs"]
   ];
   sh.getRange(r, 1, kv.length, 5).setValues(kv); r += kv.length + 2;
 
@@ -969,8 +989,11 @@ function stage1_normalizeDedupeExpire_(sourceSheets, logSheet, deleteAuditSheet,
 
       // normalize urls
       if (idx.entryLink > -1) row[idx.entryLink] = DataNormalizer.normalizeUrl(String(row[idx.entryLink] || ""));
-      if (idx.rulesUrl > -1) row[idx.rulesUrl] = DataNormalizer.normalizeUrl(String(row[idx.rulesUrl] || ""));
-      if (idx.rulesUrl > -1 && idx.entryLink > -1 && !String(row[idx.rulesUrl] || "").trim()) row[idx.rulesUrl] = row[idx.entryLink];
+      if (idx.rulesUrl > -1) {
+        row[idx.rulesUrl] = DataNormalizer.normalizeUrl(String(row[idx.rulesUrl] || ""));
+        // Default rules_url to entry_link if missing (common pattern in scraped data)
+        if (!String(row[idx.rulesUrl] || "").trim() && idx.entryLink > -1) row[idx.rulesUrl] = row[idx.entryLink];
+      }
 
       // normalize image
       if (idx.image > -1) row[idx.image] = DataNormalizer.normalizeImageUrl(String(row[idx.image] || ""));
@@ -1750,6 +1773,13 @@ const LLMService = {
         if (!result.short_description || !result.long_description) throw new Error("LLM returned empty short/long");
         if (!result.image_alt) result.image_alt = "Sweepstakes promotional image";
 
+        // Phase 1 Enhancement: Track LLM costs
+        if (toBool2_(adjust.ops?.enableLlmCostTracking)) {
+          const inputTokens = Math.ceil((promptBase.length + 200) / 4); // Rough estimate
+          const outputTokens = Math.ceil((outputText.length) / 4);
+          trackLlmCost_(RUN ? RUN.runId : "", adjust.llm.model, inputTokens, outputTokens, "enrich");
+        }
+
         this._cache[cacheKey] = result;
         return result;
       } catch (e) {
@@ -2070,3 +2100,84 @@ function safeCell_(row, idx) {
   if (idx == null || idx < 0) return "";
   return row[idx];
 }
+
+/** ========================================================================
+ * PHASE 1 ENHANCEMENTS (v2.5)
+ * ===================================================================== */
+
+/**
+ * LLM Cost Tracking - Logs token usage and estimated costs
+ */
+function ensureLlmCostSheet_(ss) {
+  let sh = ss.getSheetByName(CONFIG.SHEETS.LLM_COST);
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEETS.LLM_COST);
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(["Timestamp", "RunId", "Model", "InputTokens", "OutputTokens", "EstimatedCost", "Notes"]);
+  }
+  return sh;
+}
+
+function trackLlmCost_(runId, model, inputTokens, outputTokens, notes) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ensureLlmCostSheet_(ss);
+    
+    const rates = CONFIG.LLM_COSTS[model] || CONFIG.LLM_COSTS["gpt-4o-mini"];
+    const cost = (inputTokens / 1000 * rates.input) + (outputTokens / 1000 * rates.output);
+    
+    sheet.appendRow([new Date(), runId, model, inputTokens, outputTokens, cost, notes || ""]);
+  } catch (e) {
+    // Silent fail - cost tracking is non-critical
+  }
+}
+
+/**
+ * Email Notifications - Alerts operator on errors
+ */
+function notifyOperator_(adjust, severity, subject, body) {
+  try {
+    const emailEnabled = toBool2_(adjust.ops?.enableEmailNotifications);
+    const emailAddress = String(adjust.ops?.operatorEmail || "").trim();
+    
+    if (!emailEnabled || !emailAddress) return;
+    
+    if (severity === "ERROR" || severity === "CRITICAL") {
+      MailApp.sendEmail({
+        to: emailAddress,
+        subject: `[Sweepza ${severity}] ${subject}`,
+        body: `Run ID: ${RUN ? RUN.runId : "N/A"}\n\n${body}\n\n---\nCheck Sweepza_Logs for details.`
+      });
+    }
+  } catch (e) {
+    // Silent fail - email is non-critical
+  }
+}
+
+/**
+ * Automatic Backups - Creates daily Master sheet snapshots
+ */
+function createDailyBackup_(ss, logSheet) {
+  try {
+    const backupEnabled = toBool2_(readAdjustConfigSafe_(ss).ops?.enableDailyBackups);
+    if (!backupEnabled) return;
+    
+    const master = ss.getSheetByName(CONFIG.SHEETS.MASTER);
+    if (!master || master.getLastRow() < 2) return; // Nothing to backup
+    
+    const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "yyyy-MM-dd");
+    const archiveName = `Master_Backup_${today}`;
+    
+    // Check if backup already exists
+    if (ss.getSheetByName(archiveName)) return;
+    
+    // Duplicate master sheet
+    const backup = master.copyTo(ss);
+    backup.setName(archiveName);
+    backup.hideSheet();
+    
+    log_(logSheet, "INFO", "BACKUP", "", `Created daily backup: ${archiveName} (${master.getLastRow() - 1} rows)`);
+  } catch (e) {
+    log_(logSheet, "WARN", "BACKUP", "", `Backup failed: ${e.message}`);
+  }
+}
+
