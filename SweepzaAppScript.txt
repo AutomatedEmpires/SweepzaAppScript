@@ -1,0 +1,2066 @@
+/****************************************************
+ * SWEEPZA MASTER SCRIPT v2.4 (Single-file, copy/paste)
+ * Public entrypoints ONLY:
+ *   1) sweepzaSetup()
+ *   2) sweepzaPipeline()
+ *
+ * v2.4 upgrades (no omissions):
+ * - Full self-bootstrap: works when only Freebie_Guy exists
+ * - Adjust sheet self-repair: creates required headers/tables if missing
+ * - Source Map = single source-of-truth for which sheets run
+ * - LLM cap default 500 rows/run (Adjust-controlled)
+ * - Row height set to 20px in setup; optional enforce every run
+ * - Buffered logs + buffered delete audit (massive perf improvement)
+ * - Continuation trigger is safe (tracked by ID; does not break recurring triggers)
+ * - Operator controls expanded in Adjust ("ops" section)
+ * - Harder validations + LLM QA gates before export
+ ****************************************************/
+
+/** =========================
+ * CONFIG (minimal, stable)
+ * ========================= */
+const CONFIG = {
+  SPREADSHEET_ID: "1sbMxIMmdaG_W13ideKV0AS3TddIjA-_ZIlO-3f9Qzdg",
+  TIMEZONE: "America/Los_Angeles",
+
+  SHEETS: {
+    CONTROL: "Sweepza_Control",
+    ADJUST: "Sweepza_Master_Adjust",
+    SOURCE_MAP: "Sweepza_Source_Map",
+    LOG: "Sweepza_Logs",
+    RUNS: "Sweepza_Run_History",
+    DELETE_AUDIT: "Sweepza_Delete_Audit",
+    MASTER: "Master_Export_Sheet"
+  },
+
+  PROPS: {
+    OPENAI_KEY: "OPENAI_API_KEY",
+    TRIGGER_TIME_ID: "SWEEPZA_TIME_TRIGGER_ID",
+    TRIGGER_CHANGE_ID: "SWEEPZA_CHANGE_TRIGGER_ID",
+    TRIGGER_CONT_ID: "SWEEPZA_CONT_TRIGGER_ID"
+  },
+
+  LIMITS: {
+    LOCK_TIMEOUT_MS: 25000,
+    MAX_RUNTIME_MS: 5.7 * 60 * 1000
+  }
+};
+
+/** =========================
+ * Globals (per run)
+ * ========================= */
+let LOG_BUFFER = [];
+let AUDIT_BUFFER = [];
+let RUN = null;
+
+/** ========================================================================
+ * PUBLIC ENTRYPOINTS (ONLY TWO)
+ * ===================================================================== */
+
+/**
+ * One-time setup. Safe to run repeatedly.
+ */
+function sweepzaSetup() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  ss.setSpreadsheetTimeZone(CONFIG.TIMEZONE);
+
+  ensureControlSheet_(ss);
+  ensureLogSheet_(ss);
+  ensureRunHistorySheet_(ss);
+  ensureDeleteAuditSheet_(ss);
+  ensureSourceMapSheet_(ss);
+
+  // Ensure Adjust exists + has all required tables/headers; never blindly nukes user content
+  ensureAdjustSheetStructure_(ss);
+
+  // Parse adjust (robust)
+  const adjust = readAdjustConfigSafe_(ss);
+
+  // Ensure Master exists + headers match Adjust
+  const master = ensureMasterSheet_(ss, adjust);
+  validateMasterHeadersOrThrow_(master, adjust);
+
+  // Enforce row height (default 20)
+  const px = num_(adjust.ui?.rowHeightPx, 20);
+  setSpreadsheetRowHeights_(ss, px);
+
+  // Inventory sheets into Source Map (preserve enabled flags)
+  refreshSourceMap_(ss, adjust);
+
+  // Install/update triggers (time-based + optional onChange)
+  installOrUpdateTriggers_(ss, adjust);
+
+  SpreadsheetApp.flush();
+}
+
+/**
+ * Main pipeline (production). Safe and resumable.
+ */
+function sweepzaPipeline() {
+  return sweepzaPipeline_();
+}
+
+/** ========================================================================
+ * PIPELINE ORCHESTRATION
+ * ===================================================================== */
+
+function sweepzaPipeline_() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(CONFIG.LIMITS.LOCK_TIMEOUT_MS)) return;
+
+  const start = Date.now();
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  ss.setSpreadsheetTimeZone(CONFIG.TIMEZONE);
+
+  const control = ensureControlSheet_(ss);
+  const logSheet = ensureLogSheet_(ss);
+  const runSheet = ensureRunHistorySheet_(ss);
+  const deleteSheet = ensureDeleteAuditSheet_(ss);
+  const sourceMap = ensureSourceMapSheet_(ss);
+
+  RUN = newRunContext_();
+
+  try {
+    // Hard bootstrap for “only Freebie_Guy exists” scenarios
+    ensureAdjustSheetStructure_(ss);
+    const adjust = readAdjustConfigSafe_(ss);
+
+    // Optional enforce row height each run
+    if (toBool2_(adjust.ui?.enforceRowHeightEveryRun)) {
+      setSpreadsheetRowHeights_(ss, num_(adjust.ui?.rowHeightPx, 20));
+    }
+
+    const master = ensureMasterSheet_(ss, adjust);
+    validateMasterHeadersOrThrow_(master, adjust);
+
+    // Settings from Control + Adjust ops
+    const settings = readControlSettings_(control, sourceMap, adjust);
+    RUN.settings = settings;
+
+    log_(logSheet, "INFO", "PIPELINE", "", `=== RUN START ${RUN.runId} ===`);
+
+    // Ensure Source Map is present and header rows known
+    const headerRowByName = loadHeaderRowMap_(sourceMap);
+
+    // Find enabled sheets from Source Map
+    const sourceNames = settings.sourceSheets;
+    if (!sourceNames.length) {
+      throw new Error("No enabled source sheets. Set enabled=TRUE for at least one sheet in Sweepza_Source_Map.");
+    }
+
+    // Ensure sources exist; ensure columns exist
+    const sources = sourceNames.map(n => ensureSourceSheet_(ss, n));
+    for (const sh of sources) {
+      const hr = headerRowByName[sh.getName()] || 1;
+      ensureSourceColumns_(sh, logSheet, adjust, hr);
+    }
+
+    // Stage 0: Optional master pre-clean (perf: keep small)
+    if (toBool2_(adjust.ops?.masterPreCleanEachRun)) {
+      stage4_masterHygiene_(master, logSheet, deleteSheet, adjust, settings.deleteExpired, settings.dryRun);
+    }
+
+    // Stage 1: Normalize + Dedupe + Expire sources
+    stage1_normalizeDedupeExpire_(sources, logSheet, deleteSheet, adjust, headerRowByName, settings);
+
+    // Stage 2: LLM enrich (bounded by runtime + max rows/run; default 500)
+    const llmRemaining = stage2_llmEnrich_(sources, logSheet, start, adjust, headerRowByName, settings);
+
+    // Stage 2.5: Optional LLM output gate (hard validation) before export
+    if (toBool2_(adjust.ops?.validateLlmBeforeExport)) {
+      stage2b_validateLlmOutputs_(sources, logSheet, adjust, headerRowByName, settings);
+    }
+
+    // Stage 3: Export to Master + mark exported
+    stage3_exportToMaster_(sources, master, logSheet, adjust, headerRowByName, settings);
+
+    // Stage 4: Master hygiene: normalize, dedupe, expire
+    stage4_masterHygiene_(master, logSheet, deleteSheet, adjust, settings.deleteExpired, settings.dryRun);
+
+    // Stage 5: Optional Master QA stage (LLM)
+    if (settings.enableMasterQACheck && toBool2_(adjust.llm?.enableMasterQA)) {
+      stage5_masterQACheck_(master, logSheet, start, adjust, settings);
+    }
+
+    RUN.durationMs = Date.now() - start;
+    writeRunHistory_(runSheet, RUN);
+    log_(logSheet, "INFO", "PIPELINE", "", `RUN SUMMARY ${RUN.runId}: normalized=${RUN.counts.normalized}, deduped=${RUN.counts.deduped}, invalidUrlDropped=${RUN.counts.invalidUrlDropped}, expiredDropped=${RUN.counts.expiredDropped}, llmProcessed=${RUN.counts.llmProcessed}, llmErrors=${RUN.counts.llmErrors}, llmRejected=${RUN.counts.llmRejected}, exported=${RUN.counts.exported}, masterDropped=${RUN.counts.masterDropped}, durationMs=${RUN.durationMs}`);
+    log_(logSheet, "INFO", "PIPELINE", "", `=== RUN END ${RUN.runId} ===`);
+
+    flushLogs_(logSheet);
+    flushAudit_(deleteSheet);
+
+    // Continuation if backlog remains and enabled
+    if (llmRemaining > 0 && toBool2_(adjust.triggers?.autoContinueEnabled)) {
+      scheduleContinuationTrigger_(adjust);
+      log_(logSheet, "INFO", "PIPELINE", "", `Continuation scheduled; LLM remaining rows: ${llmRemaining}`);
+      flushLogs_(logSheet);
+    } else {
+      clearContinuationTrigger_();
+    }
+
+  } catch (e) {
+    RUN.durationMs = Date.now() - start;
+    RUN.error = String(e && e.stack ? e.stack : e);
+    try { writeRunHistory_(runSheet, RUN); } catch (_) {}
+
+    log_(logSheet, "ERROR", "PIPELINE", "", `FATAL ${RUN.runId}: ${RUN.error}`);
+    flushLogs_(logSheet);
+    flushAudit_(deleteSheet);
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** ========================================================================
+ * CONTROL + SETTINGS
+ * ===================================================================== */
+
+function ensureControlSheet_(ss) {
+  let sh = ss.getSheetByName(CONFIG.SHEETS.CONTROL);
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEETS.CONTROL);
+
+  // Lightweight “panel” defaults (idempotent)
+  sh.getRange("A1").setValue("Sweepza Control Panel");
+  sh.getRange("A2").setValue("DELETE_EXPIRED (TRUE/FALSE)");
+  sh.getRange("A3").setValue("ENABLE_MASTER_QA (TRUE/FALSE)");
+  sh.getRange("A4").setValue("DRY_RUN (TRUE/FALSE)");
+  sh.getRange("A6").setValue("Notes:");
+  sh.getRange("A7").setValue("- Enable/disable sheets in Sweepza_Source_Map (enabled=TRUE).");
+  sh.getRange("A8").setValue("- Schema + prompts + limits + ops controls are in Sweepza_Master_Adjust.");
+
+  if (String(sh.getRange("B2").getValue() || "").trim() === "") sh.getRange("B2").setValue(false);
+  if (String(sh.getRange("B3").getValue() || "").trim() === "") sh.getRange("B3").setValue(true);
+  if (String(sh.getRange("B4").getValue() || "").trim() === "") sh.getRange("B4").setValue(false);
+
+  return sh;
+}
+
+function readControlSettings_(controlSheet, sourceMapSheet, adjust) {
+  const deleteExpired = toBool_(controlSheet.getRange("B2").getValue());
+  const enableMasterQACheck = toBool_(controlSheet.getRange("B3").getValue());
+  const dryRun = toBool_(controlSheet.getRange("B4").getValue());
+
+  // Source Map enabled=TRUE
+  let sourceSheets = [];
+  const lr = sourceMapSheet.getLastRow();
+  if (lr >= 2) {
+    const rows = sourceMapSheet.getRange(2, 1, lr - 1, 2).getValues(); // name, enabled
+    sourceSheets = rows
+      .filter(r => toBool_(r[1]))
+      .map(r => String(r[0] || "").trim())
+      .filter(Boolean);
+  }
+
+  // Optional: auto-enable Freebie_Guy on first run if nothing enabled
+  if (!sourceSheets.length && toBool2_(adjust.ops?.autoEnableFreebieGuyIfNone)) {
+    const fg = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName("Freebie_Guy");
+    if (fg) {
+      autoEnableInSourceMap_("Freebie_Guy");
+      sourceSheets = ["Freebie_Guy"];
+    }
+  }
+
+  return {
+    deleteExpired,
+    enableMasterQACheck,
+    dryRun,
+    sourceSheets
+  };
+}
+
+function autoEnableInSourceMap_(sheetName) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const map = ensureSourceMapSheet_(ss);
+    const lr = map.getLastRow();
+    if (lr < 2) return;
+    const rows = map.getRange(2, 1, lr - 1, 2).getValues();
+    for (let i = 0; i < rows.length; i++) {
+      if (String(rows[i][0] || "").trim() === sheetName) {
+        map.getRange(2 + i, 2).setValue(true);
+        break;
+      }
+    }
+  } catch (_) {}
+}
+
+/** ========================================================================
+ * SOURCE MAP
+ * ===================================================================== */
+
+function ensureSourceMapSheet_(ss) {
+  let sh = ss.getSheetByName(CONFIG.SHEETS.SOURCE_MAP);
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEETS.SOURCE_MAP);
+
+  const need = ["sheet_name", "enabled", "header_row", "has_headers", "detected_headers_preview", "notes"];
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(need);
+  } else {
+    const header = sh.getRange(1, 1, 1, Math.max(1, sh.getLastColumn())).getValues()[0].map(x => String(x || "").trim().toLowerCase());
+    if (header.join("|") !== need.join("|")) {
+      sh.clear();
+      sh.appendRow(need);
+    }
+  }
+  return sh;
+}
+
+function refreshSourceMap_(ss, adjust) {
+  const mapSheet = ensureSourceMapSheet_(ss);
+
+  const ignore = new Set([
+    CONFIG.SHEETS.CONTROL,
+    CONFIG.SHEETS.ADJUST,
+    CONFIG.SHEETS.SOURCE_MAP,
+    CONFIG.SHEETS.LOG,
+    CONFIG.SHEETS.RUNS,
+    CONFIG.SHEETS.DELETE_AUDIT,
+    CONFIG.SHEETS.MASTER
+  ]);
+
+  // Preserve enabled + header_row + notes
+  const existing = {};
+  const lr = mapSheet.getLastRow();
+  if (lr >= 2) {
+    const rows = mapSheet.getRange(2, 1, lr - 1, 6).getValues();
+    rows.forEach(r => {
+      const name = String(r[0] || "").trim();
+      if (!name) return;
+      existing[name] = { enabled: r[1], header_row: r[2], notes: r[5] };
+    });
+  }
+
+  const out = [];
+  ss.getSheets().forEach(sh => {
+    const name = sh.getName();
+    if (ignore.has(name)) return;
+
+    const detected = detectHeaderRow_(sh, adjust);
+    const prev = existing[name];
+
+    out.push([
+      name,
+      prev ? toBool_(prev.enabled) : false,
+      prev && Number(prev.header_row) ? Number(prev.header_row) : (detected.headerRow || 1),
+      detected.hasHeaders,
+      detected.preview,
+      prev ? (prev.notes || "") : ""
+    ]);
+  });
+
+  // rewrite rows below header
+  if (mapSheet.getLastRow() > 1) {
+    mapSheet.getRange(2, 1, mapSheet.getLastRow() - 1, 6).clearContent();
+  }
+  if (out.length) mapSheet.getRange(2, 1, out.length, 6).setValues(out);
+}
+
+function detectHeaderRow_(sheet, adjust) {
+  const requiredCanon = ["entryLink", "endDate"];
+  const requiredAliases = requiredCanon.map(c => adjust.schema.source[c] || []);
+  const maxRowsToCheck = Math.min(6, sheet.getMaxRows());
+  const maxCols = Math.min(100, Math.max(1, sheet.getLastColumn()));
+
+  for (let r = 1; r <= maxRowsToCheck; r++) {
+    const row = sheet.getRange(r, 1, 1, maxCols).getValues()[0].map(v => String(v || "").trim());
+    const nonEmpty = row.filter(Boolean);
+    if (!nonEmpty.length) continue;
+
+    const lower = row.map(x => String(x || "").toLowerCase());
+    let hits = 0;
+
+    for (const aliasList of requiredAliases) {
+      const found = aliasList.some(a => lower.indexOf(String(a).toLowerCase()) !== -1);
+      if (found) hits++;
+    }
+
+    if (hits === requiredCanon.length) {
+      return { hasHeaders: true, headerRow: r, preview: nonEmpty.slice(0, 12).join(" | ") };
+    }
+  }
+
+  const first = sheet.getRange(1, 1, 1, maxCols).getValues()[0].map(v => String(v || "").trim()).filter(Boolean);
+  return { hasHeaders: first.length > 0, headerRow: 1, preview: first.slice(0, 12).join(" | ") };
+}
+
+function loadHeaderRowMap_(sourceMapSheet) {
+  const map = {};
+  const lr = sourceMapSheet.getLastRow();
+  if (lr < 2) return map;
+  const rows = sourceMapSheet.getRange(2, 1, lr - 1, 3).getValues(); // name, enabled, header_row
+  rows.forEach(r => {
+    const name = String(r[0] || "").trim();
+    if (!name) return;
+    const hr = Number(r[2] || 1);
+    map[name] = hr > 0 ? hr : 1;
+  });
+  return map;
+}
+
+/** ========================================================================
+ * ADJUST SHEET (structure + robust parser)
+ * ===================================================================== */
+
+function ensureAdjustSheetStructure_(ss) {
+  let sh = ss.getSheetByName(CONFIG.SHEETS.ADJUST);
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEETS.ADJUST);
+
+  // We do NOT wipe existing content. Instead:
+  // 1) Ensure the required headers appear somewhere (top template if empty)
+  // 2) If headers missing, append a known-good template below current content
+  const values = sh.getDataRange().getValues();
+  const flat = values.flat().map(v => String(v || "").trim()).filter(Boolean).map(s => s.toLowerCase());
+  const has = (t) => flat.indexOf(String(t).toLowerCase()) !== -1;
+
+  const requiredMarkers = ["SECTION","CanonicalField","MasterHeader","TagName","Domain","PromptKey"];
+  const missingAny = requiredMarkers.some(m => !has(m));
+
+  if (sh.getLastRow() === 0) {
+    writeAdjustTemplate_(sh, 1);
+    return;
+  }
+
+  if (missingAny) {
+    const startRow = sh.getLastRow() + 2;
+    sh.getRange(startRow, 1).setValue("Sweepza Master Adjust (AUTO-REPAIRED TEMPLATE BELOW — you may copy/merge into your preferred layout)");
+    writeAdjustTemplate_(sh, startRow + 2);
+  }
+}
+
+// Template writer (single canonical layout). Parser searches for header tokens anywhere.
+function writeAdjustTemplate_(sh, startRow) {
+  let r = startRow;
+
+  // Title
+  sh.getRange(r, 1).setValue("Sweepza Master Adjust (EDIT THIS SHEET, NOT THE CODE)");
+  r += 2;
+
+  // KV header
+  sh.getRange(r, 1, 1, 5).setValues([["SECTION","KEY","VALUE","","NOTES"]]); r++;
+
+  const kv = [
+    ["ui","rowHeightPx","20","","Row height applied on setup"],
+    ["ui","enforceRowHeightEveryRun","FALSE","","If TRUE, enforces row heights each run"],
+
+    ["date","expireGraceDays","1","","Days after end_date before expired"],
+
+    ["wix","maxTags","3","","Max tags to export"],
+    ["wix","tagsAsJsonArrayString","TRUE","","TRUE => JSON array string; FALSE => comma list"],
+
+    ["llm","model","gpt-4o-mini","","OpenAI model"],
+    ["llm","apiUrl","https://api.openai.com/v1/responses","","OpenAI Responses endpoint"],
+    ["llm","maxOutputTokens","650","",""],
+    ["llm","maxRetries","3","",""],
+    ["llm","retryBaseMs","800","",""],
+    ["llm","maxLlmRowsPerRun","500","","Default 500 per run"],
+    ["llm","enableMasterQA","TRUE","","Master QA stage enabled"],
+    ["llm","maxMasterReviewPerRun","200","","Master QA rows per run"],
+
+    ["triggers","runEveryHours","24","","Time trigger cadence"],
+    ["triggers","timeTriggerEnabled","TRUE","","Install/update time trigger"],
+    ["triggers","onChangeEnabled","FALSE","","Install/update onChange trigger"],
+    ["triggers","autoContinueEnabled","TRUE","","If LLM backlog remains, schedule continuation"],
+    ["triggers","continuationAfterMs","60000","","Continuation delay in ms"],
+
+    ["tag","endsSoonMinDays","1","","Ends Soon minimum day offset (inclusive)"],
+    ["tag","endsSoonMaxDays","5","","Ends Soon maximum day offset (inclusive)"],
+    ["tag","newMaxDays","3","","Extracted date within N days qualifies as New"],
+
+    // Operator controls (new)
+    ["ops","autoEnableFreebieGuyIfNone","TRUE","","If no enabled sheets, auto-enable Freebie_Guy if present"],
+    ["ops","masterPreCleanEachRun","FALSE","","If TRUE, runs master hygiene early (slower)"],
+    ["ops","validateLlmBeforeExport","TRUE","","If TRUE, rejects LLM outputs not meeting rules"],
+    ["ops","minShortDescChars","40","","Reject too-short outputs (guardrail)"],
+    ["ops","minLongDescChars","120","","Reject too-short outputs (guardrail)"],
+    ["ops","maxShortDescChars","240","","Trim if too long"],
+    ["ops","maxLongDescChars","900","","Trim if too long"],
+    ["ops","requireSeoAltText","TRUE","","Require image_alt non-empty (LLM will generate fallback)"],
+    ["ops","exportRequiresEndDate","TRUE","","If TRUE, skips export if end_date missing"],
+    ["ops","exportRequiresImage","FALSE","","If TRUE, skips export if image missing"]
+  ];
+  sh.getRange(r, 1, kv.length, 5).setValues(kv); r += kv.length + 2;
+
+  // Schema headers
+  sh.getRange(r, 1).setValue("SOURCE SCHEMA (Canonical field → acceptable header names/aliases)");
+  sh.getRange(r, 4).setValue("MASTER SCHEMA (Master_Export_Sheet headers, in order)");
+  r++;
+
+  sh.getRange(r, 1, 1, 2).setValues([["CanonicalField","Aliases (comma-separated; first is preferred output name)"]]);
+  sh.getRange(r, 4, 1, 1).setValues([["MasterHeader"]]);
+  r++;
+
+  const src = [
+    ["title","Scrub_Title, Title"],
+    ["desc","Scrub_Description, Description"],
+    ["endDate","End_Date, End Date, EndDate"],
+    ["extractedDate","Extracted_Date, Scrub_Date, Extracted Date"],
+    ["entryLink","Entry_Link, Entry Link, URL"],
+    ["rulesUrl","Rules_URL, Rules Url, Rules Link"],
+    ["image","Entry_Image, Image, Image_URL"],
+    ["entryLimit","Entry_Limit, Entry Limit"],
+    ["eligibility","Eligibility, Eligible"],
+    ["numPrizes","Number_Prizes, Num_Prizes, Number of Prizes"],
+    ["metaDesc","Meta_Description, Meta Description"],
+    ["metaKeywords","Meta_Keywords, Meta Keywords"],
+    ["tags","Tags"],
+    ["shortSummary","short_summary"],
+    ["longDescription","long_description"],
+    ["imageAlt","image_alt"],
+    ["endDateNorm","end_date_norm"],
+    ["extractedDateNorm","extracted_date_norm"],
+    ["endDateEpoch","end_date_epoch"],
+    ["extractedDateEpoch","extracted_date_epoch"],
+    ["llmProcessed","llm_processed"],
+    ["exported","exported"],
+    ["lastSeenRunId","last_seen_run_id"],
+    ["llmVersion","llm_version"],
+    ["llmHash","llm_hash"]
+  ];
+
+  const master = [
+    "title",
+    "short_summary",
+    "long_description",
+    "tags",
+    "end_date",
+    "entry_link",
+    "rules_url",
+    "image",
+    "image_alt",
+    "meta_description",
+    "meta_keywords",
+    "scrub_date",
+    "source",
+    "eligibility",
+    "number_prizes",
+    "entry_limit",
+    "qa_flag",
+    "qa_notes"
+  ];
+
+  sh.getRange(r, 1, src.length, 2).setValues(src);
+  sh.getRange(r, 4, master.length, 1).setValues(master.map(x => [x]));
+  r += Math.max(src.length, master.length) + 2;
+
+  // Tag precedence + Social domains
+  sh.getRange(r, 1).setValue("TAG PRECEDENCE (top wins, will be truncated to maxTags)");
+  sh.getRange(r, 4).setValue("SOCIAL DOMAINS (one per row)");
+  r++;
+
+  sh.getRange(r, 1, 1, 2).setValues([["TagName","Enabled (TRUE/FALSE)"]]);
+  sh.getRange(r, 4, 1, 1).setValues([["Domain"]]);
+  r++;
+
+  const tags = [
+    ["Ends Today","TRUE"],
+    ["Ends Soon","TRUE"],
+    ["New","TRUE"],
+    ["Instant Win","TRUE"],
+    ["Social Media","TRUE"],
+    ["Daily Entry","TRUE"],
+    ["Single Entry","TRUE"]
+  ];
+  const domains = [
+    "instagram.com","facebook.com","tiktok.com","twitter.com","x.com","youtube.com","youtu.be",
+    "pinterest.com","snapchat.com","reddit.com","twitch.tv","linkedin.com","threads.net",
+    "bsky.app","bluesky.social","discord.gg","t.me","telegram.me","whatsapp.com"
+  ];
+  sh.getRange(r, 1, tags.length, 2).setValues(tags);
+  sh.getRange(r, 4, domains.length, 1).setValues(domains.map(d => [d]));
+  r += Math.max(tags.length, domains.length) + 2;
+
+  // Prompts
+  sh.getRange(r, 1).setValue("LLM PROMPTS (edit carefully)"); r++;
+  sh.getRange(r, 1, 1, 2).setValues([["PromptKey","PromptText"]]); r++;
+
+  const enrich = `You are writing enticing website copy for a sweepstakes listing.
+You MUST use only provided input fields. Do NOT invent sponsors, dates, prize values, ARV, winner counts, or requirements.
+
+Return ONLY valid JSON:
+{
+  "short_description": "...",
+  "long_description": "...",
+  "image_alt": "..."
+}
+
+Rules:
+- short_description: 1–2 sentences; clear, energetic, and benefit-driven. Avoid fluff.
+- long_description: 1–2 paragraphs; fun tone; explains what to do to enter WITHOUT adding steps not in input.
+- SEO: Use natural keywords found in the title/description (do not keyword-stuff). Avoid clickbait claims.
+- Do NOT explicitly mention eligibility, entry limits, number of prizes unless the input text already makes it central and unavoidable.
+- If image URL is missing/blank, set image_alt to "Sweepstakes promotional image".
+- Never claim endorsement, affiliation, or guaranteed winning.`;
+
+  const qa = `You are a QA reviewer for a sweepstakes listing before export to Wix CMS.
+Do NOT add facts. Do NOT rewrite. Only evaluate and flag issues.
+
+Return ONLY valid JSON:
+{
+  "qa_flag": "OK" or "REVIEW",
+  "qa_notes": "short note explaining issues, if any"
+}
+
+Flag REVIEW if:
+- Short/long description appear to invent details (sponsor, dates, prize values, steps).
+- Text is empty, incoherent, or does not match title/description context.
+- Obvious policy risk: claims of guaranteed winning, fake urgency, or non-factual statements.`;
+
+  sh.getRange(r, 1, 2, 2).setValues([
+    ["enrich_prompt", enrich],
+    ["qa_prompt", qa]
+  ]);
+}
+
+function readAdjustConfigSafe_(ss) {
+  try {
+    return readAdjustConfig_(ss);
+  } catch (e) {
+    // Attempt repair once
+    ensureAdjustSheetStructure_(ss);
+    return readAdjustConfig_(ss);
+  }
+}
+
+/**
+ * Robustly parses Adjust by locating table headers anywhere.
+ */
+function readAdjustConfig_(ss) {
+  const sh = ss.getSheetByName(CONFIG.SHEETS.ADJUST);
+  if (!sh) throw new Error("Missing Sweepza_Master_Adjust. Run sweepzaSetup().");
+
+  const values = sh.getDataRange().getValues();
+
+  function findRowExact_(text) {
+    const needle = String(text).trim().toLowerCase();
+    for (let r = 0; r < values.length; r++) {
+      for (let c = 0; c < values[r].length; c++) {
+        const cell = String(values[r][c] || "").trim().toLowerCase();
+        if (cell === needle) return { r, c };
+      }
+    }
+    return null;
+  }
+
+  function readKV_(startPos) {
+    // KV assumed in columns A,B,C from row after "SECTION" header row
+    const kv = {};
+    for (let r = startPos.r + 1; r < values.length; r++) {
+      const a = String(values[r][0] || "").trim();
+      const b = String(values[r][1] || "").trim();
+      const c = String(values[r][2] || "").trim();
+      const A = a.toUpperCase();
+
+      if (A.includes("SOURCE SCHEMA") || A.includes("MASTER SCHEMA") || A.includes("TAG PRECEDENCE") || A.includes("LLM PROMPTS")) break;
+      if (!a || !b) continue;
+      if (!kv[a]) kv[a] = {};
+      kv[a][b] = c;
+    }
+    return kv;
+  }
+
+  function readTableDown_(headerPos, colA, colB) {
+    const out = [];
+    for (let r = headerPos.r + 1; r < values.length; r++) {
+      const a = String(values[r][colA] || "").trim();
+      const b = colB == null ? "" : String(values[r][colB] || "").trim();
+      if (!a) break;
+      out.push([a, b]);
+    }
+    return out;
+  }
+
+  // KV
+  const kvPos = findRowExact_("SECTION");
+  if (!kvPos) throw new Error("Adjust sheet: missing KV header 'SECTION'.");
+  const kv = readKV_(kvPos);
+
+  // Source schema
+  const srcPos = findRowExact_("CanonicalField");
+  if (!srcPos) throw new Error("Adjust sheet: missing 'CanonicalField' header.");
+  const srcRows = readTableDown_(srcPos, 0, 1);
+  const sourceSchema = {};
+  srcRows.forEach(([canon, aliases]) => {
+    const list = String(aliases || "").split(",").map(s => s.trim()).filter(Boolean);
+    if (canon && list.length) sourceSchema[canon] = list;
+  });
+
+  // Master schema (MasterHeader in column D)
+  const masterPos = findRowExact_("MasterHeader");
+  if (!masterPos) throw new Error("Adjust sheet: missing 'MasterHeader' header.");
+  const masterRows = readTableDown_(masterPos, 3, null);
+  const masterHeaders = masterRows.map(([h]) => h).filter(Boolean);
+
+  // Tag precedence
+  const tagPos = findRowExact_("TagName");
+  if (!tagPos) throw new Error("Adjust sheet: missing 'TagName' header.");
+  const tagRows = readTableDown_(tagPos, 0, 1);
+  const tagPrecedence = tagRows.filter(([, enabled]) => toBool2_(enabled)).map(([tag]) => tag);
+
+  // Social domains (Domain in column D)
+  const domPos = findRowExact_("Domain");
+  if (!domPos) throw new Error("Adjust sheet: missing 'Domain' header.");
+  const domRows = readTableDown_(domPos, 3, null);
+  const socialDomains = domRows.map(([d]) => String(d).toLowerCase()).filter(Boolean);
+
+  // Prompts
+  const promptPos = findRowExact_("PromptKey");
+  if (!promptPos) throw new Error("Adjust sheet: missing 'PromptKey' header.");
+  const promptRows = readTableDown_(promptPos, 0, 1);
+  const prompts = {};
+  promptRows.forEach(([k, v]) => { if (k) prompts[k] = String(v || ""); });
+
+  const adjust = {
+    ui: {
+      rowHeightPx: num_((kv.ui && kv.ui.rowHeightPx), 20),
+      enforceRowHeightEveryRun: toBool2_(kv.ui && kv.ui.enforceRowHeightEveryRun)
+    },
+    date: {
+      expireGraceDays: num_((kv.date && kv.date.expireGraceDays), 1)
+    },
+    wix: {
+      maxTags: num_((kv.wix && kv.wix.maxTags), 3),
+      tagsAsJsonArrayString: toBool2_(kv.wix && kv.wix.tagsAsJsonArrayString)
+    },
+    llm: {
+      model: (kv.llm && kv.llm.model) || "gpt-4o-mini",
+      apiUrl: (kv.llm && kv.llm.apiUrl) || "https://api.openai.com/v1/responses",
+      maxOutputTokens: num_((kv.llm && kv.llm.maxOutputTokens), 650),
+      maxRetries: num_((kv.llm && kv.llm.maxRetries), 3),
+      retryBaseMs: num_((kv.llm && kv.llm.retryBaseMs), 800),
+      maxLlmRowsPerRun: num_((kv.llm && kv.llm.maxLlmRowsPerRun), 500),
+      enableMasterQA: toBool2_(kv.llm && kv.llm.enableMasterQA),
+      maxMasterReviewPerRun: num_((kv.llm && kv.llm.maxMasterReviewPerRun), 200),
+      enrichPrompt: prompts.enrich_prompt || "",
+      qaPrompt: prompts.qa_prompt || ""
+    },
+    triggers: {
+      runEveryHours: num_((kv.triggers && kv.triggers.runEveryHours), 24),
+      timeTriggerEnabled: toBool2_(kv.triggers && kv.triggers.timeTriggerEnabled),
+      onChangeEnabled: toBool2_(kv.triggers && kv.triggers.onChangeEnabled),
+      autoContinueEnabled: toBool2_(kv.triggers && kv.triggers.autoContinueEnabled),
+      continuationAfterMs: num_((kv.triggers && kv.triggers.continuationAfterMs), 60000)
+    },
+    ops: {
+      autoEnableFreebieGuyIfNone: toBool2_(kv.ops && kv.ops.autoEnableFreebieGuyIfNone),
+      masterPreCleanEachRun: toBool2_(kv.ops && kv.ops.masterPreCleanEachRun),
+      validateLlmBeforeExport: toBool2_(kv.ops && kv.ops.validateLlmBeforeExport),
+      minShortDescChars: num_((kv.ops && kv.ops.minShortDescChars), 40),
+      minLongDescChars: num_((kv.ops && kv.ops.minLongDescChars), 120),
+      maxShortDescChars: num_((kv.ops && kv.ops.maxShortDescChars), 240),
+      maxLongDescChars: num_((kv.ops && kv.ops.maxLongDescChars), 900),
+      requireSeoAltText: toBool2_(kv.ops && kv.ops.requireSeoAltText),
+      exportRequiresEndDate: toBool2_(kv.ops && kv.ops.exportRequiresEndDate),
+      exportRequiresImage: toBool2_(kv.ops && kv.ops.exportRequiresImage)
+    },
+    tag: {
+      endsSoonMinDays: num_((kv.tag && kv.tag.endsSoonMinDays), 1),
+      endsSoonMaxDays: num_((kv.tag && kv.tag.endsSoonMaxDays), 5),
+      newMaxDays: num_((kv.tag && kv.tag.newMaxDays), 3),
+      precedence: tagPrecedence.length ? tagPrecedence : ["Ends Today","Ends Soon","New","Instant Win","Social Media","Daily Entry","Single Entry"],
+      socialDomains
+    },
+    schema: {
+      source: sourceSchema,
+      masterHeaders
+    }
+  };
+
+  // Hard validations
+  if (!adjust.schema.masterHeaders.length) throw new Error("Adjust sheet: MASTER SCHEMA is empty.");
+  if (!adjust.schema.source.entryLink) throw new Error("Adjust sheet: SOURCE SCHEMA missing canonical 'entryLink'.");
+  if (!adjust.schema.source.endDate) throw new Error("Adjust sheet: SOURCE SCHEMA missing canonical 'endDate'.");
+  if (!adjust.llm.enrichPrompt) throw new Error("Adjust sheet: Missing LLM enrich_prompt.");
+  if (!adjust.llm.qaPrompt) adjust.llm.qaPrompt = "{\"qa_flag\":\"OK\",\"qa_notes\":\"\"}";
+
+  return adjust;
+}
+
+/** ========================================================================
+ * SYSTEM SHEETS
+ * ===================================================================== */
+
+function ensureLogSheet_(ss) {
+  let sh = ss.getSheetByName(CONFIG.SHEETS.LOG);
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEETS.LOG);
+  if (sh.getLastRow() === 0) sh.appendRow(["Timestamp", "RunId", "Level", "Source", "Row", "Message"]);
+  return sh;
+}
+
+function ensureRunHistorySheet_(ss) {
+  let sh = ss.getSheetByName(CONFIG.SHEETS.RUNS);
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEETS.RUNS);
+  if (sh.getLastRow() === 0) {
+    sh.appendRow([
+      "RunId", "StartedAt", "DurationMs",
+      "DeleteExpired", "EnableMasterQA", "DryRun",
+      "Sources",
+      "normalized", "deduped", "invalidUrlDropped", "expiredDropped",
+      "llmProcessed", "llmErrors", "llmRejected",
+      "exported", "masterDropped",
+      "error"
+    ]);
+  }
+  return sh;
+}
+
+function ensureDeleteAuditSheet_(ss) {
+  let sh = ss.getSheetByName(CONFIG.SHEETS.DELETE_AUDIT);
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEETS.DELETE_AUDIT);
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(["Timestamp","RunId","Sheet","Row","Reason","Entry_Link","End_Date_Raw","End_Date_Norm","End_Date_Epoch","Notes"]);
+  }
+  return sh;
+}
+
+function ensureMasterSheet_(ss, adjust) {
+  let sh = ss.getSheetByName(CONFIG.SHEETS.MASTER);
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEETS.MASTER);
+
+  const expected = adjust.schema.masterHeaders;
+  const header = getHeaderRowAt_(sh, 1);
+
+  if (!header.length) {
+    sh.getRange(1, 1, 1, expected.length).setValues([expected]);
+  } else {
+    const existing = header.map(h => String(h || "").trim());
+    if (existing.join("|") !== expected.join("|")) {
+      // Remap by header name, preserve existing data if possible
+      const lastRow = sh.getLastRow();
+      const lastCol = sh.getLastColumn();
+      const data = lastRow >= 2 ? sh.getRange(2, 1, lastRow - 1, lastCol).getValues() : [];
+      const idx = {};
+      existing.forEach((h, i) => idx[h] = i);
+
+      const rebuilt = data.map(row => expected.map(h => {
+        const i = idx[h];
+        return i == null ? "" : row[i];
+      }));
+
+      sh.clear();
+      sh.getRange(1, 1, 1, expected.length).setValues([expected]);
+      if (rebuilt.length) sh.getRange(2, 1, rebuilt.length, expected.length).setValues(rebuilt);
+    }
+  }
+  return sh;
+}
+
+function validateMasterHeadersOrThrow_(masterSheet, adjust) {
+  const header = getHeaderRowAt_(masterSheet, 1).map(h => String(h || "").trim());
+  const expected = adjust.schema.masterHeaders;
+  if (header.join("|") !== expected.join("|")) {
+    throw new Error("Master_Export_Sheet headers do not match Adjust MASTER SCHEMA (order matters). Run sweepzaSetup() to realign.");
+  }
+}
+
+/** ========================================================================
+ * SOURCE SHEETS + SCHEMA HELPERS
+ * ===================================================================== */
+
+function ensureSourceSheet_(ss, name) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
+
+function getHeaderRowAt_(sheet, headerRow) {
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return [];
+  const r = Math.max(1, Number(headerRow || 1));
+  return sheet.getRange(r, 1, 1, lastCol).getValues()[0];
+}
+
+function ensureSourceColumns_(sheet, logSheet, adjust, headerRow) {
+  const r = Math.max(1, Number(headerRow || 1));
+  const lastCol = sheet.getLastColumn();
+
+  // If totally blank sheet, initialize minimal headers from schema
+  if (lastCol === 0) {
+    const preferredCanon = ["title","desc","endDate","extractedDate","entryLink","rulesUrl","image","entryLimit","eligibility","numPrizes","metaDesc","metaKeywords"];
+    const init = [];
+    preferredCanon.forEach(c => {
+      const aliases = adjust.schema.source[c];
+      if (aliases && aliases.length) init.push(aliases[0]);
+    });
+    sheet.getRange(r, 1, 1, init.length).setValues([init]);
+    log_(logSheet, "INFO", sheet.getName(), "", "Initialized header row from Adjust source schema.");
+  }
+
+  const header = getHeaderRowAt_(sheet, r).map(h => String(h || "").trim());
+
+  // Script-managed columns (must exist)
+  const managedCanon = [
+    "tags","shortSummary","longDescription","imageAlt",
+    "endDateNorm","extractedDateNorm","endDateEpoch","extractedDateEpoch",
+    "llmProcessed","exported","lastSeenRunId","llmVersion","llmHash"
+  ];
+
+  const missing = [];
+  for (const canon of managedCanon) {
+    const aliases = adjust.schema.source[canon];
+    if (!aliases || !aliases.length) continue;
+    const preferred = aliases[0];
+    if (header.indexOf(preferred) === -1) missing.push(preferred);
+  }
+
+  if (!missing.length) return;
+
+  const safeLastCol = Math.max(1, sheet.getLastColumn());
+  sheet.insertColumnsAfter(safeLastCol, missing.length);
+  sheet.getRange(r, safeLastCol + 1, 1, missing.length).setValues([missing]);
+  log_(logSheet, "INFO", sheet.getName(), "", "Added columns: " + missing.join(", "));
+}
+
+function resolveSourceIdx_(sheet, adjust, headerRow) {
+  const header = getHeaderRowAt_(sheet, headerRow).map(h => String(h || "").trim());
+  const idx = {};
+  Object.keys(adjust.schema.source).forEach(canon => {
+    const aliases = adjust.schema.source[canon] || [];
+    let found = -1;
+    for (const a of aliases) {
+      const i = header.indexOf(a);
+      if (i !== -1) { found = i; break; }
+    }
+    idx[canon] = found;
+  });
+  idx.__headerRow = Number(headerRow || 1);
+  return idx;
+}
+
+function loadMasterSchema_(sheet) {
+  const header = getHeaderRowAt_(sheet, 1);
+  const idx = {};
+  for (let i = 0; i < header.length; i++) idx[String(header[i] || "").trim()] = i;
+  return idx;
+}
+
+/** ========================================================================
+ * STAGE 1: Normalize + Deduplicate + Expire (sources)
+ * ===================================================================== */
+
+function stage1_normalizeDedupeExpire_(sourceSheets, logSheet, deleteAuditSheet, adjust, headerRowByName, settings) {
+  const deleteExpired = !!settings.deleteExpired;
+  const dryRun = !!settings.dryRun;
+  const nowKey = DateUtils.toKey(new Date());
+
+  for (const sheet of sourceSheets) {
+    const headerRow = headerRowByName[sheet.getName()] || 1;
+    const idx = resolveSourceIdx_(sheet, adjust, headerRow);
+
+    if (idx.entryLink < 0) { log_(logSheet, "ERROR", sheet.getName(), "", "Missing required column: entryLink"); continue; }
+    if (idx.endDate < 0) { log_(logSheet, "ERROR", sheet.getName(), "", "Missing required column: endDate"); continue; }
+
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+    if (lastRow <= headerRow || lastCol < 1) continue;
+
+    const dataStartRow = headerRow + 1;
+    const values = sheet.getRange(dataStartRow, 1, lastRow - headerRow, lastCol).getValues();
+
+    const bestByEntry = new Map();
+
+    for (let i = 0; i < values.length; i++) {
+      const row = values[i];
+
+      // trim all strings
+      for (let c = 0; c < row.length; c++) if (typeof row[c] === "string") row[c] = row[c].trim();
+
+      // normalize urls
+      if (idx.entryLink > -1) row[idx.entryLink] = DataNormalizer.normalizeUrl(String(row[idx.entryLink] || ""));
+      if (idx.rulesUrl > -1) row[idx.rulesUrl] = DataNormalizer.normalizeUrl(String(row[idx.rulesUrl] || ""));
+      if (idx.rulesUrl > -1 && idx.entryLink > -1 && !String(row[idx.rulesUrl] || "").trim()) row[idx.rulesUrl] = row[idx.entryLink];
+
+      // normalize image
+      if (idx.image > -1) row[idx.image] = DataNormalizer.normalizeImageUrl(String(row[idx.image] || ""));
+
+      // clear 0 prizes
+      if (idx.numPrizes > -1) {
+        const np = row[idx.numPrizes];
+        if (np === 0 || np === "0" || String(np).trim() === "0") row[idx.numPrizes] = "";
+      }
+
+      // parse end date
+      const endParse = DateUtils.parseToMDY_(row[idx.endDate]);
+      if (idx.endDateNorm > -1) row[idx.endDateNorm] = endParse.mdy || "";
+      if (idx.endDateEpoch > -1) row[idx.endDateEpoch] = endParse.epoch || "";
+
+      // parse extracted date
+      if (idx.extractedDate > -1) {
+        const exParse = DateUtils.parseToMDY_(row[idx.extractedDate]);
+        if (idx.extractedDateNorm > -1) row[idx.extractedDateNorm] = exParse.mdy || "";
+        if (idx.extractedDateEpoch > -1) row[idx.extractedDateEpoch] = exParse.epoch || "";
+      }
+
+      if (idx.lastSeenRunId > -1) row[idx.lastSeenRunId] = RUN.runId;
+
+      const entry = String(row[idx.entryLink] || "").trim();
+      if (!entry) continue;
+
+      const key = entry.toLowerCase();
+      const extractedEpoch = (idx.extractedDateEpoch > -1) ? Number(row[idx.extractedDateEpoch] || -1) : -1;
+      if (!bestByEntry.has(key)) bestByEntry.set(key, { rowIndex: i, extractedEpoch });
+      else {
+        const cur = bestByEntry.get(key);
+        if (extractedEpoch > cur.extractedEpoch || (cur.extractedEpoch < 0 && extractedEpoch < 0 && i > cur.rowIndex)) {
+          bestByEntry.set(key, { rowIndex: i, extractedEpoch });
+        }
+      }
+
+      RUN.counts.normalized++;
+    }
+
+    const kept = [];
+    for (let i = 0; i < values.length; i++) {
+      const row = values[i];
+      const sheetRowNumber = dataStartRow + i;
+
+      if (String(row.join("")).trim() === "") continue;
+
+      const entry = String(row[idx.entryLink] || "").trim();
+      if (!entry || !DataNormalizer.isHttpUrl(entry)) {
+        RUN.counts.invalidUrlDropped++;
+        audit_(sheet.getName(), sheetRowNumber, "INVALID_ENTRY_LINK", entry, safeCell_(row, idx.endDate), safeCell_(row, idx.endDateNorm), safeCell_(row, idx.endDateEpoch), "Entry_Link missing or not http(s)");
+        log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, "Dropped: invalid Entry_Link");
+        continue;
+      }
+
+      const key = entry.toLowerCase();
+      if (bestByEntry.has(key) && bestByEntry.get(key).rowIndex !== i) {
+        RUN.counts.deduped++;
+        audit_(sheet.getName(), sheetRowNumber, "DUPLICATE_ENTRY_LINK", entry, safeCell_(row, idx.endDate), safeCell_(row, idx.endDateNorm), safeCell_(row, idx.endDateEpoch), "Duplicate; kept best by extracted date");
+        log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, "Dropped: duplicate Entry_Link");
+        continue;
+      }
+
+      const endEpoch = (idx.endDateEpoch > -1) ? Number(row[idx.endDateEpoch] || "") : NaN;
+      const endNorm = (idx.endDateNorm > -1) ? String(row[idx.endDateNorm] || "") : "";
+      const expired = DateUtils.isExpiredEpoch_(endEpoch, adjust.date.expireGraceDays);
+
+      if (expired && deleteExpired) {
+        RUN.counts.expiredDropped++;
+        audit_(sheet.getName(), sheetRowNumber, "EXPIRED_CONFIRMED", entry, safeCell_(row, idx.endDate), endNorm, endEpoch, `Expired confirmed vs todayKey=${nowKey}`);
+        log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, `Dropped: expired (end_date_norm=${endNorm})`);
+        continue;
+      }
+
+      kept.push(row);
+    }
+
+    if (!dryRun) {
+      sheet.getRange(dataStartRow, 1, lastRow - headerRow, lastCol).clearContent();
+      if (kept.length) sheet.getRange(dataStartRow, 1, kept.length, lastCol).setValues(kept);
+    } else {
+      log_(logSheet, "INFO", sheet.getName(), "", `[DRY_RUN] Would rewrite source with ${kept.length} rows`);
+    }
+  }
+}
+
+/** ========================================================================
+ * STAGE 2: LLM enrichment (batched, default 500/run)
+ * ===================================================================== */
+
+function stage2_llmEnrich_(sourceSheets, logSheet, runStartMs, adjust, headerRowByName, settings) {
+  const dryRun = !!settings.dryRun;
+
+  const apiKey = PropertiesService.getScriptProperties().getProperty(CONFIG.PROPS.OPENAI_KEY) || "";
+  if (!apiKey) {
+    log_(logSheet, "ERROR", "LLM", "", `Missing ${CONFIG.PROPS.OPENAI_KEY} in Script Properties.`);
+    return 0;
+  }
+
+  let remaining = 0;
+  let processedThisRun = 0;
+
+  for (const sheet of sourceSheets) {
+    const headerRow = headerRowByName[sheet.getName()] || 1;
+    const idx = resolveSourceIdx_(sheet, adjust, headerRow);
+
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+    if (lastRow <= headerRow || lastCol < 1) continue;
+
+    const dataStartRow = headerRow + 1;
+    const values = sheet.getRange(dataStartRow, 1, lastRow - headerRow, lastCol).getValues();
+
+    const candidates = [];
+    for (let i = 0; i < values.length; i++) {
+      const row = values[i];
+
+      const entry = idx.entryLink > -1 ? String(row[idx.entryLink] || "").trim() : "";
+      if (!entry || !DataNormalizer.isHttpUrl(entry)) continue;
+
+      const alreadyProcessed = idx.llmProcessed > -1 ? toBool_(row[idx.llmProcessed]) : false;
+
+      const title = idx.title > -1 ? String(row[idx.title] || "").trim() : "";
+      const desc = idx.desc > -1 ? String(row[idx.desc] || "").trim() : "";
+      const eligibility = idx.eligibility > -1 ? String(row[idx.eligibility] || "").trim() : "";
+      const entryLimit = idx.entryLimit > -1 ? String(row[idx.entryLimit] || "").trim() : "";
+      const numPrizes = idx.numPrizes > -1 ? String(row[idx.numPrizes] || "").trim() : "";
+      const image = idx.image > -1 ? String(row[idx.image] || "").trim() : "";
+
+      const fingerprint = `${title}|${desc}|${eligibility}|${entryLimit}|${numPrizes}|${image}`;
+      const fpHash = HashUtils.sha256Base64_(fingerprint);
+      const existingHash = idx.llmHash > -1 ? String(row[idx.llmHash] || "") : "";
+
+      // If changed, re-run LLM
+      if (!alreadyProcessed || existingHash !== fpHash) {
+        candidates.push({ i, fpHash, payload: { title, desc, eligibility, entryLimit, numPrizes, image }, entry });
+      }
+    }
+
+    remaining += candidates.length;
+
+    for (const item of candidates) {
+      if (processedThisRun >= adjust.llm.maxLlmRowsPerRun) return remaining;
+      if (Date.now() - runStartMs > CONFIG.LIMITS.MAX_RUNTIME_MS) return remaining;
+
+      const row = values[item.i];
+      const sheetRowNumber = dataStartRow + item.i;
+
+      if (dryRun) {
+        log_(logSheet, "INFO", sheet.getName(), sheetRowNumber, `[DRY_RUN] Would LLM-enrich entry=${item.entry}`);
+        processedThisRun++;
+        continue;
+      }
+
+      const llmRes = LLMService.callWithRetry_(apiKey, adjust, item.entry, item.payload);
+      if (llmRes.error) {
+        RUN.counts.llmErrors++;
+        log_(logSheet, "ERROR", sheet.getName(), sheetRowNumber, "LLM error: " + llmRes.error);
+      } else {
+        if (idx.shortSummary > -1) row[idx.shortSummary] = llmRes.short_description;
+        if (idx.longDescription > -1) row[idx.longDescription] = llmRes.long_description;
+        if (idx.imageAlt > -1) row[idx.imageAlt] = llmRes.image_alt;
+
+        if (idx.llmProcessed > -1) row[idx.llmProcessed] = true;
+        if (idx.llmVersion > -1) row[idx.llmVersion] = `openai:${adjust.llm.model}`;
+        if (idx.llmHash > -1) row[idx.llmHash] = item.fpHash;
+
+        RUN.counts.llmProcessed++;
+        log_(logSheet, "INFO", sheet.getName(), sheetRowNumber, "LLM processed");
+      }
+
+      processedThisRun++;
+      remaining--;
+    }
+
+    if (!dryRun) {
+      sheet.getRange(dataStartRow, 1, lastRow - headerRow, lastCol).setValues(values);
+    }
+  }
+
+  return remaining;
+}
+
+/**
+ * Stage 2b: Validates LLM outputs before export (guardrails; operator controlled)
+ */
+function stage2b_validateLlmOutputs_(sourceSheets, logSheet, adjust, headerRowByName, settings) {
+  const dryRun = !!settings.dryRun;
+  const minS = num_(adjust.ops?.minShortDescChars, 40);
+  const minL = num_(adjust.ops?.minLongDescChars, 120);
+  const maxS = num_(adjust.ops?.maxShortDescChars, 240);
+  const maxL = num_(adjust.ops?.maxLongDescChars, 900);
+  const requireAlt = toBool2_(adjust.ops?.requireSeoAltText);
+
+  for (const sheet of sourceSheets) {
+    const headerRow = headerRowByName[sheet.getName()] || 1;
+    const idx = resolveSourceIdx_(sheet, adjust, headerRow);
+
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+    if (lastRow <= headerRow || lastCol < 1) continue;
+
+    const dataStartRow = headerRow + 1;
+    const values = sheet.getRange(dataStartRow, 1, lastRow - headerRow, lastCol).getValues();
+    let changed = false;
+
+    for (let i = 0; i < values.length; i++) {
+      const row = values[i];
+      const sheetRowNumber = dataStartRow + i;
+
+      const processed = idx.llmProcessed > -1 ? toBool_(row[idx.llmProcessed]) : false;
+      if (!processed) continue;
+
+      const shortS = idx.shortSummary > -1 ? String(row[idx.shortSummary] || "").trim() : "";
+      const longS = idx.longDescription > -1 ? String(row[idx.longDescription] || "").trim() : "";
+      const altS = idx.imageAlt > -1 ? String(row[idx.imageAlt] || "").trim() : "";
+
+      // Basic constraints
+      let bad = false;
+      let reasons = [];
+
+      if (shortS.length < minS) { bad = true; reasons.push("short too short"); }
+      if (longS.length < minL) { bad = true; reasons.push("long too short"); }
+
+      // Prohibited claims
+      const blob = (shortS + " " + longS).toLowerCase();
+      const prohibited = ["guaranteed", "you will win", "100% win", "officially endorsed by"];
+      if (prohibited.some(p => blob.includes(p))) { bad = true; reasons.push("prohibited claim"); }
+
+      if (requireAlt && !altS) { bad = true; reasons.push("missing image_alt"); }
+
+      // Trim overlong to protect Wix CMS rendering consistency
+      let newShort = shortS, newLong = longS;
+      if (newShort.length > maxS) newShort = newShort.slice(0, maxS).trim();
+      if (newLong.length > maxL) newLong = newLong.slice(0, maxL).trim();
+
+      if (bad) {
+        RUN.counts.llmRejected++;
+        log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, "LLM rejected before export: " + reasons.join(", "));
+        // Mark as not processed so it can be re-run next time (or operator can inspect)
+        if (idx.llmProcessed > -1) row[idx.llmProcessed] = false;
+        changed = true;
+      } else {
+        if (idx.shortSummary > -1 && newShort !== shortS) { row[idx.shortSummary] = newShort; changed = true; }
+        if (idx.longDescription > -1 && newLong !== longS) { row[idx.longDescription] = newLong; changed = true; }
+      }
+    }
+
+    if (changed && !dryRun) {
+      sheet.getRange(dataStartRow, 1, lastRow - headerRow, lastCol).setValues(values);
+    }
+  }
+}
+
+/** ========================================================================
+ * STAGE 3: Export to Master + mark exported
+ * ===================================================================== */
+
+function stage3_exportToMaster_(sourceSheets, masterSheet, logSheet, adjust, headerRowByName, settings) {
+  const dryRun = !!settings.dryRun;
+
+  const mh = getHeaderRowAt_(masterSheet, 1);
+  const appendRows = [];
+  const updates = [];
+
+  for (const sheet of sourceSheets) {
+    const headerRow = headerRowByName[sheet.getName()] || 1;
+    const idx = resolveSourceIdx_(sheet, adjust, headerRow);
+
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+    if (lastRow <= headerRow) continue;
+
+    const dataStartRow = headerRow + 1;
+    const values = sheet.getRange(dataStartRow, 1, lastRow - headerRow, lastCol).getValues();
+
+    for (let i = 0; i < values.length; i++) {
+      const row = values[i];
+      const sheetRowNumber = dataStartRow + i;
+
+      const entry = idx.entryLink > -1 ? String(row[idx.entryLink] || "").trim() : "";
+      if (!entry || !DataNormalizer.isHttpUrl(entry)) continue;
+
+      const processed = idx.llmProcessed > -1 ? toBool_(row[idx.llmProcessed]) : false;
+      const exported = idx.exported > -1 ? toBool_(row[idx.exported]) : false;
+      if (!processed || exported) continue;
+
+      const title = idx.title > -1 ? String(row[idx.title] || "").trim() : "";
+      const shortSummary = idx.shortSummary > -1 ? String(row[idx.shortSummary] || "").trim() : "";
+      const longDesc = idx.longDescription > -1 ? String(row[idx.longDescription] || "").trim() : "";
+      const endNorm = idx.endDateNorm > -1 ? String(row[idx.endDateNorm] || "").trim() : "";
+      const img = idx.image > -1 ? String(row[idx.image] || "").trim() : "";
+
+      if (!title || !shortSummary || !longDesc) {
+        log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, "Skipped export: missing title/short/long");
+        continue;
+      }
+      if (toBool2_(adjust.ops?.exportRequiresEndDate) && !endNorm) {
+        log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, "Skipped export: end_date missing (ops.exportRequiresEndDate=TRUE)");
+        continue;
+      }
+      if (toBool2_(adjust.ops?.exportRequiresImage) && !img) {
+        log_(logSheet, "WARN", sheet.getName(), sheetRowNumber, "Skipped export: image missing (ops.exportRequiresImage=TRUE)");
+        continue;
+      }
+
+      // Deterministic tags at export time
+      const endEpoch = idx.endDateEpoch > -1 ? Number(row[idx.endDateEpoch] || "") : NaN;
+      const exEpoch = idx.extractedDateEpoch > -1 ? Number(row[idx.extractedDateEpoch] || "") : NaN;
+
+      const endObj = isFinite(endEpoch) ? new Date(endEpoch) : null;
+      const exObj = isFinite(exEpoch) ? new Date(exEpoch) : null;
+
+      const tagsArr = TagEngine.compute_(
+        adjust,
+        new Date(),
+        endObj,
+        exObj,
+        idx.entryLimit > -1 ? String(row[idx.entryLimit] || "") : "",
+        title,
+        idx.desc > -1 ? String(row[idx.desc] || "") : "",
+        entry,
+        idx.rulesUrl > -1 ? String(row[idx.rulesUrl] || "") : ""
+      );
+
+      const tagsOut = adjust.wix.tagsAsJsonArrayString
+        ? JSON.stringify(tagsArr.slice(0, adjust.wix.maxTags))
+        : tagsArr.slice(0, adjust.wix.maxTags).join(", ");
+
+      // image alt (ensure non-empty fallback)
+      let imageAlt = idx.imageAlt > -1 ? String(row[idx.imageAlt] || "").trim() : "";
+      if (!imageAlt) imageAlt = "Sweepstakes promotional image";
+
+      const exportData = {
+        title,
+        short_summary: shortSummary,
+        long_description: longDesc,
+        tags: tagsOut,
+        end_date: endNorm,
+        entry_link: entry,
+        rules_url: idx.rulesUrl > -1 ? String(row[idx.rulesUrl] || "") : "",
+        image: img,
+        image_alt: imageAlt,
+        meta_description: idx.metaDesc > -1 ? String(row[idx.metaDesc] || "") : "",
+        meta_keywords: idx.metaKeywords > -1 ? String(row[idx.metaKeywords] || "") : "",
+        scrub_date: idx.extractedDateNorm > -1 ? String(row[idx.extractedDateNorm] || "") : "",
+        source: sheet.getName(),
+        eligibility: idx.eligibility > -1 ? String(row[idx.eligibility] || "") : "",
+        number_prizes: idx.numPrizes > -1 ? String(row[idx.numPrizes] || "") : "",
+        entry_limit: idx.entryLimit > -1 ? String(row[idx.entryLimit] || "") : "",
+        qa_flag: "",
+        qa_notes: ""
+      };
+
+      appendRows.push(buildMasterRow_(mh, exportData));
+
+      if (idx.exported > -1) row[idx.exported] = true;
+      RUN.counts.exported++;
+      log_(logSheet, "INFO", sheet.getName(), sheetRowNumber, "Exported to master + marked exported");
+    }
+
+    updates.push({ sheet, values, dataStartRow, lastRow, headerRow, lastCol });
+  }
+
+  if (appendRows.length) {
+    if (!dryRun) {
+      masterSheet.getRange(masterSheet.getLastRow() + 1, 1, appendRows.length, mh.length).setValues(appendRows);
+    } else {
+      log_(logSheet, "INFO", masterSheet.getName(), "", `[DRY_RUN] Would append ${appendRows.length} rows`);
+    }
+  } else {
+    log_(logSheet, "INFO", "EXPORT", "", "No rows eligible for export (needs llm_processed=TRUE and exported not TRUE).");
+  }
+
+  if (!dryRun) {
+    for (const u of updates) {
+      if (u.lastRow > u.headerRow) {
+        u.sheet.getRange(u.dataStartRow, 1, u.lastRow - u.headerRow, u.lastCol).setValues(u.values);
+      }
+    }
+  }
+}
+
+/** ========================================================================
+ * STAGE 4: Master hygiene + expire + dedupe
+ * ===================================================================== */
+
+function stage4_masterHygiene_(masterSheet, logSheet, deleteAuditSheet, adjust, deleteExpired, dryRun) {
+  const midx = loadMasterSchema_(masterSheet);
+  const lastRow = masterSheet.getLastRow();
+  const lastCol = masterSheet.getLastColumn();
+  if (lastRow < 2) return;
+
+  const values = masterSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  // normalize cells
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+
+    if (midx.entry_link != null) row[midx.entry_link] = DataNormalizer.normalizeUrl(String(row[midx.entry_link] || ""));
+    if (midx.rules_url != null) row[midx.rules_url] = DataNormalizer.normalizeUrl(String(row[midx.rules_url] || ""));
+    if (midx.rules_url != null && midx.entry_link != null && !String(row[midx.rules_url] || "").trim()) row[midx.rules_url] = row[midx.entry_link];
+
+    if (midx.image != null) row[midx.image] = DataNormalizer.normalizeImageUrl(String(row[midx.image] || ""));
+    if (midx.tags != null) row[midx.tags] = normalizeMasterTagsCell_(row[midx.tags], adjust);
+
+    if (midx.number_prizes != null) {
+      const np = row[midx.number_prizes];
+      if (np === 0 || np === "0" || String(np).trim() === "0") row[midx.number_prizes] = "";
+    }
+
+    for (let c = 0; c < row.length; c++) if (typeof row[c] === "string") row[c] = row[c].trim();
+  }
+
+  // dedupe by entry_link keep newest scrub_date
+  const bestByEntry = new Map();
+  for (let i = 0; i < values.length; i++) {
+    const entry = midx.entry_link != null ? String(values[i][midx.entry_link] || "").trim() : "";
+    if (!entry) continue;
+
+    const scrubStr = midx.scrub_date != null ? String(values[i][midx.scrub_date] || "").trim() : "";
+    const scrubParse = DateUtils.parseToMDY_(scrubStr);
+    const scrubEpoch = scrubParse.epoch || -1;
+
+    const key = entry.toLowerCase();
+    if (!bestByEntry.has(key)) bestByEntry.set(key, { i, scrubEpoch });
+    else {
+      const cur = bestByEntry.get(key);
+      if (scrubEpoch > cur.scrubEpoch || (cur.scrubEpoch < 0 && scrubEpoch < 0 && i > cur.i)) {
+        bestByEntry.set(key, { i, scrubEpoch });
+      }
+    }
+  }
+
+  const kept = [];
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    const sheetRow = i + 2;
+
+    const entry = midx.entry_link != null ? String(row[midx.entry_link] || "").trim() : "";
+    const endStr = midx.end_date != null ? String(row[midx.end_date] || "").trim() : "";
+
+    if (!entry || !DataNormalizer.isHttpUrl(entry)) {
+      RUN.counts.masterDropped++;
+      audit_(masterSheet.getName(), sheetRow, "MASTER_INVALID_ENTRY_LINK", entry, endStr, endStr, "", "Invalid entry_link in master");
+      continue;
+    }
+
+    const key = entry.toLowerCase();
+    if (bestByEntry.has(key) && bestByEntry.get(key).i !== i) {
+      RUN.counts.masterDropped++;
+      audit_(masterSheet.getName(), sheetRow, "MASTER_DUPLICATE", entry, endStr, endStr, "", "Duplicate in master; kept newest scrub_date");
+      continue;
+    }
+
+    const endParse = DateUtils.parseToMDY_(endStr);
+    const expired = DateUtils.isExpiredEpoch_(endParse.epoch, adjust.date.expireGraceDays);
+
+    if (expired && deleteExpired) {
+      RUN.counts.masterDropped++;
+      audit_(masterSheet.getName(), sheetRow, "MASTER_EXPIRED_CONFIRMED", entry, endStr, endParse.mdy, endParse.epoch, "Expired confirmed in master");
+      continue;
+    }
+
+    kept.push(row);
+  }
+
+  if (!dryRun) {
+    masterSheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
+    if (kept.length) masterSheet.getRange(2, 1, kept.length, lastCol).setValues(kept);
+  } else {
+    log_(logSheet, "INFO", masterSheet.getName(), "", `[DRY_RUN] Would rewrite master with ${kept.length} rows`);
+  }
+}
+
+/** ========================================================================
+ * STAGE 5: Optional Master QA (LLM)
+ * ===================================================================== */
+
+function stage5_masterQACheck_(masterSheet, logSheet, runStartMs, adjust, settings) {
+  const dryRun = !!settings.dryRun;
+  const apiKey = PropertiesService.getScriptProperties().getProperty(CONFIG.PROPS.OPENAI_KEY) || "";
+  if (!apiKey || dryRun) return;
+
+  const midx = loadMasterSchema_(masterSheet);
+  const lastRow = masterSheet.getLastRow();
+  const lastCol = masterSheet.getLastColumn();
+  if (lastRow < 2) return;
+
+  const values = masterSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  let checked = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    if (checked >= adjust.llm.maxMasterReviewPerRun) break;
+    if (Date.now() - runStartMs > CONFIG.LIMITS.MAX_RUNTIME_MS) break;
+
+    const row = values[i];
+    const sheetRow = i + 2;
+
+    const qaFlag = midx.qa_flag != null ? String(row[midx.qa_flag] || "").trim() : "";
+    if (qaFlag) continue;
+
+    const title = midx.title != null ? String(row[midx.title] || "").trim() : "";
+    const shortSummary = midx.short_summary != null ? String(row[midx.short_summary] || "").trim() : "";
+    const longDesc = midx.long_description != null ? String(row[midx.long_description] || "").trim() : "";
+    const imageAlt = midx.image_alt != null ? String(row[midx.image_alt] || "").trim() : "";
+    const tags = midx.tags != null ? String(row[midx.tags] || "").trim() : "";
+
+    if (!title || !shortSummary || !longDesc) {
+      if (midx.qa_flag != null) row[midx.qa_flag] = "REVIEW";
+      if (midx.qa_notes != null) row[midx.qa_notes] = "Missing required content fields";
+      checked++;
+      continue;
+    }
+
+    const qa = LLMService.masterQACheck_(apiKey, adjust, title, shortSummary, longDesc, imageAlt, tags);
+    if (qa.error) {
+      log_(logSheet, "ERROR", masterSheet.getName(), sheetRow, "Master QA LLM error: " + qa.error);
+    } else {
+      if (midx.qa_flag != null) row[midx.qa_flag] = qa.qa_flag || "OK";
+      if (midx.qa_notes != null) row[midx.qa_notes] = qa.qa_notes || "";
+    }
+
+    checked++;
+  }
+
+  masterSheet.getRange(2, 1, lastRow - 1, lastCol).setValues(values);
+  log_(logSheet, "INFO", masterSheet.getName(), "", `Master QA checked rows: ${checked}`);
+}
+
+/** ========================================================================
+ * TAG ENGINE
+ * ===================================================================== */
+
+const TagEngine = {
+  compute_: function(adjust, now, endDate, extractedDate, entryLimit, title, desc, entryUrl, rulesUrl) {
+    const detected = [];
+    const enabled = {};
+    (adjust.tag.precedence || []).forEach(t => enabled[t] = true);
+
+    const todayKey = DateUtils.toKey(now);
+    const endKey = endDate ? DateUtils.toKey(endDate) : "";
+
+    if (enabled["Ends Today"] && endDate && endKey === todayKey) detected.push("Ends Today");
+
+    if (enabled["Ends Soon"] && endDate && endKey !== todayKey) {
+      const diffDays = DateUtils.daysBetween(DateUtils.startOfDay_(now), DateUtils.startOfDay_(endDate));
+      if (diffDays >= adjust.tag.endsSoonMinDays && diffDays <= adjust.tag.endsSoonMaxDays) detected.push("Ends Soon");
+    }
+
+    if (enabled["New"] && extractedDate) {
+      const extractedDays = DateUtils.daysBetween(DateUtils.startOfDay_(extractedDate), DateUtils.startOfDay_(now));
+      if (extractedDays >= 0 && extractedDays <= adjust.tag.newMaxDays) detected.push("New");
+    }
+
+    const lim = String(entryLimit || "").toLowerCase();
+    const blob = (String(title || "") + " " + String(desc || "")).toLowerCase();
+
+    if (enabled["Daily Entry"] && ["daily", "once per day", "enter daily", "2x per day", "play daily", "return daily"].some(s => lim.includes(s) || blob.includes(s))) detected.push("Daily Entry");
+    if (enabled["Single Entry"] && ["single entry", "one time", "limit 1", "one entry", "one per person", "one (1) entry"].some(s => lim.includes(s) || blob.includes(s))) detected.push("Single Entry");
+
+    if (enabled["Instant Win"]) {
+      const instantSignals = ["instant win","win instantly","instant winner","spin to win","prize wheel","scratch","scratch-off","match & win","play now to win","play for instant"];
+      const instantNegative = ["game of skill", "skill-based"];
+      if (instantSignals.some(s => blob.includes(s)) && !instantNegative.some(s => blob.includes(s))) detected.push("Instant Win");
+    }
+
+    if (enabled["Social Media"] && (this._isDirectSocialUrl(adjust, entryUrl) || this._isDirectSocialUrl(adjust, rulesUrl))) detected.push("Social Media");
+
+    return this.enforceRules_(adjust, detected);
+  },
+
+  enforceRules_: function(adjust, detected) {
+    const set = {};
+    detected.forEach(t => { if (t) set[String(t)] = true; });
+    if (set["Ends Today"] && set["Ends Soon"]) delete set["Ends Soon"];
+
+    const out = [];
+    for (const t of (adjust.tag.precedence || [])) {
+      if (set[t]) out.push(t);
+      if (out.length >= adjust.wix.maxTags) break;
+    }
+    return out;
+  },
+
+  _isDirectSocialUrl: function(adjust, url) {
+    if (!url || typeof url !== "string") return false;
+    let s = url.trim();
+    if (!s) return false;
+    if (s.startsWith("//")) s = "https:" + s;
+    if (!DataNormalizer.isHttpUrl(s)) return false;
+    try {
+      const u = new URL(s);
+      let host = (u.hostname || "").toLowerCase();
+      if (host.startsWith("www.")) host = host.slice(4);
+      const socials = (adjust.tag.socialDomains || []).map(x => String(x).toLowerCase());
+      return socials.some(d => host === d || host.endsWith("." + d));
+    } catch (_) {
+      return false;
+    }
+  }
+};
+
+/** ========================================================================
+ * DATE UTILS
+ * ===================================================================== */
+
+const DateUtils = {
+  toKey: function(d) {
+    return Utilities.formatDate(d, CONFIG.TIMEZONE, "yyyy-MM-dd");
+  },
+  startOfDay_: function(d) {
+    const key = this.toKey(d);
+    const parts = key.split("-");
+    return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+  },
+  daysBetween: function(a, b) {
+    const ms = this.startOfDay_(b).getTime() - this.startOfDay_(a).getTime();
+    return Math.round(ms / 86400000);
+  },
+  parseToMDY_: function(v) {
+    const d = this.parse_(v);
+    if (!d) return { epoch: null, mdy: "" };
+    const mdy = Utilities.formatDate(d, CONFIG.TIMEZONE, "MM/dd/yyyy");
+    return { epoch: d.getTime(), mdy };
+  },
+  parse_: function(v) {
+    if (v === null || v === undefined || v === "") return null;
+    if (v instanceof Date && !isNaN(v.getTime())) return v;
+
+    let raw = v;
+    if (typeof raw === "string") raw = raw.trim();
+    if (typeof raw === "string" && raw === "") return null;
+
+    // numeric string
+    if (typeof raw === "string" && /^\d+(\.\d+)?$/.test(raw)) raw = Number(raw);
+
+    if (typeof raw === "number" && isFinite(raw)) {
+      // ms epoch
+      if (raw > 1000000000000) { const dms = new Date(raw); return isNaN(dms.getTime()) ? null : dms; }
+      // sec epoch
+      if (raw > 1000000000) { const ds = new Date(raw * 1000); return isNaN(ds.getTime()) ? null : ds; }
+      // yyyymmdd
+      if (raw >= 19000101 && raw <= 20991231) {
+        const s = String(Math.trunc(raw));
+        const yy = Number(s.slice(0, 4));
+        const mm = Number(s.slice(4, 6));
+        const dd = Number(s.slice(6, 8));
+        const dymd = new Date(yy, mm - 1, dd);
+        return isNaN(dymd.getTime()) ? null : dymd;
+      }
+      // excel serial
+      if (raw > 20000 && raw < 80000) {
+        const excelBase = new Date(Date.UTC(1899, 11, 30));
+        const dserial = new Date(excelBase.getTime() + raw * 86400000);
+        return isNaN(dserial.getTime()) ? null : dserial;
+      }
+      const dn = new Date(raw);
+      return isNaN(dn.getTime()) ? null : dn;
+    }
+
+    if (typeof raw === "string") {
+      const s2 = raw.trim();
+      const m = s2.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (m) {
+        const mm = Number(m[1]);
+        const dd = Number(m[2]);
+        const yy = Number(m[3]);
+        const d = new Date(yy, mm - 1, dd);
+        return isNaN(d.getTime()) ? null : d;
+      }
+      const d2 = new Date(s2);
+      return isNaN(d2.getTime()) ? null : d2;
+    }
+    return null;
+  },
+  isExpiredEpoch_: function(epoch, graceDays) {
+    if (!epoch || !isFinite(epoch)) return false;
+    const endDate = new Date(Number(epoch));
+    const today = new Date();
+    const diffDays = this.daysBetween(endDate, today);
+    return diffDays > (graceDays || 0);
+  }
+};
+
+/** ========================================================================
+ * NORMALIZERS
+ * ===================================================================== */
+
+const DataNormalizer = {
+  isHttpUrl: function(s) {
+    if (!s || typeof s !== "string") return false;
+    const t = s.trim().toLowerCase();
+    return t.startsWith("http://") || t.startsWith("https://");
+  },
+  normalizeUrl: function(v) {
+    if (!v || typeof v !== "string") return "";
+    let s = v.trim();
+    if (!s) return "";
+    if (s.startsWith("//")) s = "https:" + s;
+    if (s.startsWith("http://")) s = "https://" + s.slice("http://".length);
+    if (!(s.toLowerCase().startsWith("https://") || s.toLowerCase().startsWith("http://"))) return s;
+
+    try {
+      const u = new URL(s);
+      u.hostname = (u.hostname || "").toLowerCase();
+      if (u.hostname.startsWith("www.")) u.hostname = u.hostname.slice(4);
+      u.hash = "";
+      ["utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid","mc_cid","mc_eid","mkt_tok","igshid"].forEach(k => u.searchParams.delete(k));
+      if (u.pathname.length > 1 && u.pathname.endsWith("/")) u.pathname = u.pathname.slice(0, -1);
+      return u.toString();
+    } catch (e) {
+      return s;
+    }
+  },
+  normalizeImageUrl: function(v) {
+    if (!v || typeof v !== "string") return "";
+    let s = v.trim();
+    if (!s) return "";
+    s = s.replace(/&amp;/g, "&").replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/^["']+|["']+$/g, "").trim();
+    if (!s) return "";
+    if (s.startsWith("//")) s = "https:" + s;
+    if (s.startsWith("http://")) s = "https://" + s.slice("http://".length);
+    if (!(s.startsWith("https://") || s.startsWith("http://"))) return "";
+
+    const lower = s.toLowerCase();
+    const isImg = /\.(png|jpg|jpeg|webp|gif|svg)(\?|$)/i.test(lower);
+    const knownCdn = ["images.wixstatic.com","static.wixstatic.com","cloudfront.net","imgix.net","googleusercontent.com","imgur.com","cdn."].some(d => lower.includes(d));
+    if (!isImg && !knownCdn) return "";
+    return s;
+  }
+};
+
+/** ========================================================================
+ * LLM SERVICE (OpenAI Responses API)
+ * ===================================================================== */
+
+const LLMService = {
+  _cache: {},
+
+  callWithRetry_: function(apiKey, adjust, cacheKey, data) {
+    if (this._cache[cacheKey]) return this._cache[cacheKey];
+
+    const body = this._buildSweepCopyPayload_(adjust, data);
+    const options = {
+      method: "post",
+      contentType: "application/json",
+      headers: { Authorization: "Bearer " + apiKey },
+      muteHttpExceptions: true,
+      payload: JSON.stringify(body)
+    };
+
+    for (let attempt = 1; attempt <= adjust.llm.maxRetries; attempt++) {
+      try {
+        const resp = UrlFetchApp.fetch(adjust.llm.apiUrl, options);
+        const status = resp.getResponseCode();
+        const text = resp.getContentText();
+        if (status >= 400) throw new Error("HTTP " + status + " – " + text);
+
+        const parsed = JSON.parse(text);
+        const outputText = extractResponsesText_(parsed);
+        if (!outputText) throw new Error("No model output_text");
+
+        const json = JSON.parse(outputText);
+        const result = {
+          short_description: String(json.short_description || "").trim(),
+          long_description: String(json.long_description || "").trim(),
+          image_alt: String(json.image_alt || "").trim()
+        };
+
+        // Hard LLM output validations (minimum)
+        if (!result.short_description || !result.long_description) throw new Error("LLM returned empty short/long");
+        if (!result.image_alt) result.image_alt = "Sweepstakes promotional image";
+
+        this._cache[cacheKey] = result;
+        return result;
+      } catch (e) {
+        if (attempt === adjust.llm.maxRetries) return { error: String(e) };
+        Utilities.sleep(adjust.llm.retryBaseMs * Math.pow(2, attempt - 1));
+      }
+    }
+    return { error: "Exhausted retries" };
+  },
+
+  _buildSweepCopyPayload_: function(adjust, data) {
+    const promptBase = adjust.llm.enrichPrompt || "";
+    const prompt =
+`${promptBase}
+
+INPUT:
+Title: ${data.title || ""}
+Description: ${data.desc || ""}
+Eligibility: ${data.eligibility || ""}
+Entry Limit: ${data.entryLimit || ""}
+Number of Prizes: ${data.numPrizes || ""}
+Image URL: ${data.image || ""}`;
+
+    return {
+      model: adjust.llm.model,
+      input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }],
+      text: { format: { type: "json_object" } },
+      max_output_tokens: adjust.llm.maxOutputTokens
+    };
+  },
+
+  masterQACheck_: function(apiKey, adjust, title, shortSummary, longDesc, imageAlt, tags) {
+    const promptBase = adjust.llm.qaPrompt || "";
+    const prompt =
+`${promptBase}
+
+INPUT:
+Title: ${title}
+Short Summary: ${shortSummary}
+Long Description: ${longDesc}
+Image Alt: ${imageAlt}
+Tags: ${tags}`;
+
+    const body = {
+      model: adjust.llm.model,
+      input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }],
+      text: { format: { type: "json_object" } },
+      max_output_tokens: 220
+    };
+
+    const options = {
+      method: "post",
+      contentType: "application/json",
+      headers: { Authorization: "Bearer " + apiKey },
+      muteHttpExceptions: true,
+      payload: JSON.stringify(body)
+    };
+
+    try {
+      const resp = UrlFetchApp.fetch(adjust.llm.apiUrl, options);
+      const status = resp.getResponseCode();
+      const text = resp.getContentText();
+      if (status >= 400) return { error: "HTTP " + status + " – " + text };
+
+      const parsed = JSON.parse(text);
+      const outputText = extractResponsesText_(parsed);
+      if (!outputText) return { error: "No QA model output_text" };
+
+      const json = JSON.parse(outputText);
+      return { qa_flag: String(json.qa_flag || "").trim(), qa_notes: String(json.qa_notes || "").trim() };
+    } catch (e) {
+      return { error: String(e) };
+    }
+  }
+};
+
+/** ========================================================================
+ * MASTER ROW BUILD / TAG NORMALIZATION
+ * ===================================================================== */
+
+function buildMasterRow_(masterHeader, data) {
+  const row = [];
+  for (let i = 0; i < masterHeader.length; i++) {
+    const h = String(masterHeader[i] || "").trim();
+    row.push(data[h] != null ? data[h] : "");
+  }
+  return row;
+}
+
+function normalizeMasterTagsCell_(cell, adjust) {
+  let s = String(cell || "").trim();
+  if (!s) return adjust.wix.tagsAsJsonArrayString ? "[]" : "";
+
+  if (s.startsWith("[") && s.endsWith("]")) {
+    try {
+      const arr = JSON.parse(s);
+      if (Array.isArray(arr)) {
+        const enforced = TagEngine.enforceRules_(adjust, arr.map(String));
+        return adjust.wix.tagsAsJsonArrayString ? JSON.stringify(enforced) : enforced.join(", ");
+      }
+    } catch (_) {}
+  }
+
+  const parts = s.split(",").map(x => String(x || "").trim()).filter(Boolean);
+  const enforced = TagEngine.enforceRules_(adjust, parts);
+  return adjust.wix.tagsAsJsonArrayString ? JSON.stringify(enforced) : enforced.join(", ");
+}
+
+/** ========================================================================
+ * HASH UTILS
+ * ===================================================================== */
+
+const HashUtils = {
+  sha256Base64_: function(str) {
+    const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, str, Utilities.Charset.UTF_8);
+    return Utilities.base64Encode(bytes);
+  }
+};
+
+/** ========================================================================
+ * LOGGING + RUN HISTORY + DELETE AUDIT (BUFFERED)
+ * ===================================================================== */
+
+function newRunContext_() {
+  const startedAt = new Date();
+  const runId = Utilities.formatDate(startedAt, CONFIG.TIMEZONE, "yyyyMMdd-HHmmss");
+  return {
+    runId,
+    startedAt,
+    settings: null,
+    durationMs: 0,
+    error: "",
+    counts: {
+      normalized: 0,
+      deduped: 0,
+      invalidUrlDropped: 0,
+      expiredDropped: 0,
+      llmProcessed: 0,
+      llmErrors: 0,
+      llmRejected: 0,
+      exported: 0,
+      masterDropped: 0
+    }
+  };
+}
+
+function log_(logSheet, level, source, rowLabel, message) {
+  LOG_BUFFER.push([new Date(), RUN ? RUN.runId : "", String(level || ""), String(source || ""), String(rowLabel || ""), String(message || "")]);
+}
+
+function flushLogs_(logSheet) {
+  if (!LOG_BUFFER.length) return;
+  logSheet.getRange(logSheet.getLastRow() + 1, 1, LOG_BUFFER.length, 6).setValues(LOG_BUFFER);
+  LOG_BUFFER = [];
+}
+
+function audit_(sheetName, rowNumber, reason, entryLink, endRaw, endNorm, endEpoch, notes) {
+  AUDIT_BUFFER.push([
+    new Date(),
+    RUN ? RUN.runId : "",
+    sheetName,
+    rowNumber,
+    reason,
+    entryLink || "",
+    endRaw != null ? String(endRaw) : "",
+    endNorm != null ? String(endNorm) : "",
+    endEpoch != null ? String(endEpoch) : "",
+    notes || ""
+  ]);
+}
+
+function flushAudit_(deleteAuditSheet) {
+  if (!AUDIT_BUFFER.length) return;
+  deleteAuditSheet.getRange(deleteAuditSheet.getLastRow() + 1, 1, AUDIT_BUFFER.length, 10).setValues(AUDIT_BUFFER);
+  AUDIT_BUFFER = [];
+}
+
+function writeRunHistory_(runHistorySheet, run) {
+  const s = run.settings || { deleteExpired: false, enableMasterQACheck: false, dryRun: false, sourceSheets: [] };
+  runHistorySheet.appendRow([
+    run.runId,
+    run.startedAt,
+    run.durationMs,
+    s.deleteExpired,
+    s.enableMasterQACheck,
+    s.dryRun,
+    s.sourceSheets.join(", "),
+    run.counts.normalized,
+    run.counts.deduped,
+    run.counts.invalidUrlDropped,
+    run.counts.expiredDropped,
+    run.counts.llmProcessed,
+    run.counts.llmErrors,
+    run.counts.llmRejected,
+    run.counts.exported,
+    run.counts.masterDropped,
+    run.error || ""
+  ]);
+}
+
+/** ========================================================================
+ * TRIGGERS (time-based + onChange + continuation)
+ * ===================================================================== */
+
+function installOrUpdateTriggers_(ss, adjust) {
+  const props = PropertiesService.getScriptProperties();
+  const triggers = ScriptApp.getProjectTriggers();
+
+  // Remove known triggers by stored IDs
+  const timeId = props.getProperty(CONFIG.PROPS.TRIGGER_TIME_ID);
+  const changeId = props.getProperty(CONFIG.PROPS.TRIGGER_CHANGE_ID);
+
+  triggers.forEach(t => {
+    const id = safeTriggerId_(t);
+    if ((timeId && id === timeId) || (changeId && id === changeId)) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  props.deleteProperty(CONFIG.PROPS.TRIGGER_TIME_ID);
+  props.deleteProperty(CONFIG.PROPS.TRIGGER_CHANGE_ID);
+
+  // Create triggers as requested
+  if (toBool2_(adjust.triggers?.timeTriggerEnabled)) {
+    const hours = Math.max(1, num_(adjust.triggers?.runEveryHours, 24));
+    const t = ScriptApp.newTrigger("sweepzaPipeline").timeBased().everyHours(hours).create();
+    props.setProperty(CONFIG.PROPS.TRIGGER_TIME_ID, safeTriggerId_(t) || "");
+  }
+
+  if (toBool2_(adjust.triggers?.onChangeEnabled)) {
+    const t = ScriptApp.newTrigger("sweepzaPipeline").forSpreadsheet(ss).onChange().create();
+    props.setProperty(CONFIG.PROPS.TRIGGER_CHANGE_ID, safeTriggerId_(t) || "");
+  }
+
+  // Continuation is created on demand and tracked separately
+  clearContinuationTrigger_();
+}
+
+function scheduleContinuationTrigger_(adjust) {
+  clearContinuationTrigger_();
+  const ms = Math.max(15000, num_(adjust.triggers?.continuationAfterMs, 60000));
+  const t = ScriptApp.newTrigger("sweepzaPipeline").timeBased().after(ms).create();
+  PropertiesService.getScriptProperties().setProperty(CONFIG.PROPS.TRIGGER_CONT_ID, safeTriggerId_(t) || "");
+}
+
+function clearContinuationTrigger_() {
+  const props = PropertiesService.getScriptProperties();
+  const contId = props.getProperty(CONFIG.PROPS.TRIGGER_CONT_ID);
+  if (!contId) return;
+
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => {
+    const id = safeTriggerId_(t);
+    if (id === contId) ScriptApp.deleteTrigger(t);
+  });
+
+  props.deleteProperty(CONFIG.PROPS.TRIGGER_CONT_ID);
+}
+
+function safeTriggerId_(trigger) {
+  try { return trigger.getUniqueId(); } catch (_) { return ""; }
+}
+
+/** ========================================================================
+ * SPREADSHEET-WIDE ROW HEIGHT
+ * ===================================================================== */
+
+function setSpreadsheetRowHeights_(ss, heightPx) {
+  const sheets = ss.getSheets();
+  for (const sh of sheets) {
+    try {
+      const max = sh.getMaxRows();
+      const chunk = 300;
+      for (let r = 1; r <= max; r += chunk) {
+        const size = Math.min(chunk, max - r + 1);
+        sh.setRowHeights(r, size, heightPx);
+      }
+    } catch (_) {}
+  }
+}
+
+/** ========================================================================
+ * GENERAL HELPERS
+ * ===================================================================== */
+
+function toBool_(v) {
+  return v === true || v === "TRUE" || v === "true" || v === 1 || v === "1";
+}
+
+function toBool2_(v) {
+  const s = String(v || "").trim().toLowerCase();
+  return v === true || s === "true" || s === "yes" || s === "1" || s === "y";
+}
+
+function num_(v, fallback) {
+  const n = Number(v);
+  return isFinite(n) ? n : fallback;
+}
+
+function extractResponsesText_(respObj) {
+  if (respObj && typeof respObj.output_text === "string" && respObj.output_text.trim()) return respObj.output_text.trim();
+  if (respObj && Array.isArray(respObj.output)) {
+    for (let i = 0; i < respObj.output.length; i++) {
+      const item = respObj.output[i];
+      if (!item || !Array.isArray(item.content)) continue;
+      for (let j = 0; j < item.content.length; j++) {
+        const c = item.content[j];
+        if (!c) continue;
+        if (c.type === "output_text" && typeof c.text === "string" && c.text.trim()) return c.text.trim();
+        if (typeof c.text === "string" && c.text.trim()) return c.text.trim();
+      }
+    }
+  }
+  return "";
+}
+
+function safeCell_(row, idx) {
+  if (idx == null || idx < 0) return "";
+  return row[idx];
+}
