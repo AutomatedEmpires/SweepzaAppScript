@@ -1,12 +1,18 @@
 /****************************************************
- * SWEEPZA MASTER SCRIPT v2.6 (Single-file, copy/paste)
+ * SWEEPZA MASTER SCRIPT v2.7 (Single-file, copy/paste)
  * Public entrypoints ONLY:
  *   1) sweepzaSetup()
  *   2) sweepzaPipeline()
  *
+ * v2.7 upgrades:
+ * - Enhanced Master Control Panel (visual dashboard)
+ * - Quick Actions: Export CSV, Clear LLM cache, Refresh Source Map
+ * - System status tracking in Control Panel
+ * - New control flags: FORCE_FULL_REFRESH, SKIP_LLM_ENRICHMENT
+ * 
  * v2.6 upgrades:
- * - Live URL Validation (rate-limited to 50/run, checks HTTP status)
- * - Fuzzy Duplicate Detection (title-based semantic dedup)
+ * - Live URL validation with HTTP status checks (rate-limited to 50/run)
+ * - Fuzzy duplicate detection using 5-word title signatures
  * - Validation controls in Adjust sheet
  * 
  * v2.5 upgrades:
@@ -183,10 +189,16 @@ function sweepzaPipeline_() {
     stage1_normalizeDedupeExpire_(sources, logSheet, deleteSheet, adjust, headerRowByName, settings);
 
     // Stage 2: LLM enrich (bounded by runtime + max rows/run; default 500)
-    const llmRemaining = stage2_llmEnrich_(sources, logSheet, start, adjust, headerRowByName, settings);
+    // Skip if SKIP_LLM_ENRICHMENT control flag is TRUE
+    let llmRemaining = 0;
+    if (!settings.skipLlmEnrichment) {
+      llmRemaining = stage2_llmEnrich_(sources, logSheet, start, adjust, headerRowByName, settings);
+    } else {
+      log_(logSheet, "INFO", "PIPELINE", "", "Stage 2 skipped: SKIP_LLM_ENRICHMENT = TRUE");
+    }
 
     // Stage 2.5: Optional LLM output gate (hard validation) before export
-    if (toBool2_(adjust.ops?.validateLlmBeforeExport)) {
+    if (toBool2_(adjust.ops?.validateLlmBeforeExport) && !settings.skipLlmEnrichment) {
       stage2b_validateLlmOutputs_(sources, logSheet, adjust, headerRowByName, settings);
     }
 
@@ -209,11 +221,13 @@ function sweepzaPipeline_() {
     flushLogs_(logSheet);
     flushAudit_(deleteSheet);
 
+    // Update Control Panel status (v2.7)
+    updateControlPanelStatus_();
+
     // Continuation if backlog remains and enabled
     if (llmRemaining > 0 && toBool2_(adjust.triggers?.autoContinueEnabled)) {
       scheduleContinuationTrigger_(adjust);
-      log_(logSheet, "INFO", "PIPELINE", "", `Continuation scheduled; LLM remaining rows: ${llmRemaining}`);
-      flushLogs_(logSheet);
+      log_(logSheet, "INFO", "PIPELINE", "", `Continuation scheduled; LLM remaining rows: ${llmRemaining}`);\n      flushLogs_(logSheet);
     } else {
       clearContinuationTrigger_();
     }
@@ -265,9 +279,12 @@ function ensureControlSheet_(ss) {
 }
 
 function readControlSettings_(controlSheet, sourceMapSheet, adjust) {
-  const deleteExpired = toBool_(controlSheet.getRange("B2").getValue());
-  const enableMasterQACheck = toBool_(controlSheet.getRange("B3").getValue());
-  const dryRun = toBool_(controlSheet.getRange("B4").getValue());
+  // Read from enhanced control panel (v2.7)
+  const deleteExpired = toBool_(controlSheet.getRange("B5").getValue());
+  const enableMasterQACheck = toBool_(controlSheet.getRange("B6").getValue());
+  const dryRun = toBool_(controlSheet.getRange("B7").getValue());
+  const forceFullRefresh = toBool_(controlSheet.getRange("B8").getValue());
+  const skipLlmEnrichment = toBool_(controlSheet.getRange("B9").getValue());
 
   // Source Map enabled=TRUE
   let sourceSheets = [];
@@ -293,6 +310,8 @@ function readControlSettings_(controlSheet, sourceMapSheet, adjust) {
     deleteExpired,
     enableMasterQACheck,
     dryRun,
+    forceFullRefresh,
+    skipLlmEnrichment,
     sourceSheets
   };
 }
@@ -311,6 +330,287 @@ function autoEnableInSourceMap_(sheetName) {
       }
     }
   } catch (_) {}
+}
+
+/** ========================================================================
+ * MASTER CONTROL QUICK ACTIONS (callable from Control Panel)
+ * ===================================================================== */
+
+/**
+ * Manual trigger to refresh Source Map without running full pipeline
+ */
+function refreshSourceMapManual() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const adjust = readAdjustConfigSafe_(ss);
+  refreshSourceMap_(ss, adjust);
+  
+  const control = ss.getSheetByName(CONFIG.SHEETS.CONTROL);
+  if (control) {
+    updateControlPanelStatus_();
+  }
+  
+  SpreadsheetApp.getUi().alert("Source Map refreshed successfully!\n\nCheck Sweepza_Source_Map to enable/disable sheets.");
+}
+
+/**
+ * Clear LLM cache - forces re-enrichment of all rows
+ */
+function clearLlmCache() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    "Clear LLM Cache?",
+    "This will clear llm_processed flags, forcing re-enrichment of ALL rows.\n\nThis will consume OpenAI credits. Continue?",
+    ui.ButtonSet.YES_NO
+  );
+  
+  if (response !== ui.Button.YES) return;
+  
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const adjust = readAdjustConfigSafe_(ss);
+  
+  // Clear llm_processed flag in all source sheets
+  let clearedCount = 0;
+  ss.getSheets().forEach(sheet => {
+    const name = sheet.getName();
+    if (name.startsWith("Sweepza_") || name === CONFIG.SHEETS.MASTER) return;
+    
+    try {
+      const headerRow = 1;
+      const idx = resolveSourceIdx_(sheet, adjust, headerRow);
+      
+      if (idx.llmProcessed > -1) {
+        const lastRow = sheet.getLastRow();
+        if (lastRow > headerRow) {
+          sheet.getRange(headerRow + 1, idx.llmProcessed + 1, lastRow - headerRow, 1).clearContent();
+          clearedCount++;
+        }
+      }
+    } catch (e) {
+      // Skip sheets without llm_processed column
+    }
+  });
+  
+  ui.alert(`LLM cache cleared!\n\nCleared llm_processed flags in ${clearedCount} sheet(s).\n\nNext pipeline run will re-enrich all rows.`);
+}
+
+/**
+ * Export Master sheet to CSV file
+ */
+function exportMasterToCsv() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const master = ss.getSheetByName(CONFIG.SHEETS.MASTER);
+  
+  if (!master || master.getLastRow() < 2) {
+    SpreadsheetApp.getUi().alert("Master sheet is empty. Run sweepzaPipeline() first.");
+    return;
+  }
+  
+  const fileName = `Sweepza_Master_Export_${Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "yyyy-MM-dd_HHmmss")}.csv`;
+  const csvData = master.getDataRange().getValues();
+  const csv = csvData.map(row => row.map(cell => {
+    const str = String(cell || "");
+    // Escape quotes and wrap in quotes if contains comma, quote, or newline
+    if (str.indexOf(',') !== -1 || str.indexOf('"') !== -1 || str.indexOf('\n') !== -1) {
+      return '"' + str.replace(/"/g, '""') + '"';
+    }
+    return str;
+  }).join(',')).join('\n');
+  
+  const blob = Utilities.newBlob(csv, 'text/csv', fileName);
+  
+  // Save to Drive in same folder as spreadsheet
+  const ssFile = DriveApp.getFileById(CONFIG.SPREADSHEET_ID);
+  const folder = ssFile.getParents().hasNext() ? ssFile.getParents().next() : DriveApp.getRootFolder();
+  const file = folder.createFile(blob);
+  
+  SpreadsheetApp.getUi().alert(
+    "Export Complete!",
+    `Master sheet exported to:\n${file.getName()}\n\nLocation: ${folder.getName()}\n\nRows: ${csvData.length - 1}`,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+/**
+ * Update system status metrics in Control Panel
+ */
+function updateControlPanelStatus_() {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const control = ss.getSheetByName(CONFIG.SHEETS.CONTROL);
+    if (!control) return;
+    
+    // Check if enhanced control panel exists (v2.7)
+    const header = control.getRange("A1").getValue();
+    if (String(header).indexOf("SWEEPZA MASTER CONTROL") === -1) return;
+    
+    // Last Pipeline Run
+    const runHistory = ss.getSheetByName(CONFIG.SHEETS.RUNS);
+    if (runHistory && runHistory.getLastRow() >= 2) {
+      const lastRun = runHistory.getRange(runHistory.getLastRow(), 1, 1, 2).getValues()[0];
+      control.getRange("B17").setValue(lastRun[0]); // Timestamp
+      control.getRange("C17").setValue(lastRun[0]);
+    }
+    
+    // Enabled Source Sheets
+    const sourceMap = ss.getSheetByName(CONFIG.SHEETS.SOURCE_MAP);
+    if (sourceMap && sourceMap.getLastRow() >= 2) {
+      const enabled = sourceMap.getRange(2, 2, sourceMap.getLastRow() - 1, 1).getValues().filter(r => toBool_(r[0])).length;
+      control.getRange("B18").setValue(enabled);
+      control.getRange("C18").setValue(new Date());
+    }
+    
+    // Master Export Rows
+    const master = ss.getSheetByName(CONFIG.SHEETS.MASTER);
+    if (master) {
+      const rows = Math.max(0, master.getLastRow() - 1);
+      control.getRange("B19").setValue(rows);
+      control.getRange("C19").setValue(new Date());
+    }
+    
+  } catch (e) {
+    // Silent fail - status update is non-critical
+  }
+}
+
+/** ========================================================================
+ * MASTER CONTROL QUICK ACTIONS (callable from Control Panel)
+ * ===================================================================== */
+
+/**
+ * Manual trigger to refresh Source Map without running full pipeline
+ */
+function refreshSourceMapManual() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const adjust = readAdjustConfigSafe_(ss);
+  refreshSourceMap_(ss, adjust);
+  
+  const control = ss.getSheetByName(CONFIG.SHEETS.CONTROL);
+  if (control) {
+    control.getRange("B19").setValue(new Date()); // Update "Last Updated" for Enabled Source Sheets
+  }
+  
+  SpreadsheetApp.getUi().alert("Source Map refreshed successfully!\n\nCheck Sweepza_Source_Map to enable/disable sheets.");
+}
+
+/**
+ * Clear LLM cache - forces re-enrichment of all rows
+ */
+function clearLlmCache() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    "Clear LLM Cache?",
+    "This will clear llm_processed flags, forcing re-enrichment of ALL rows.\n\nThis will consume OpenAI credits. Continue?",
+    ui.ButtonSet.YES_NO
+  );
+  
+  if (response !== ui.Button.YES) return;
+  
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const adjust = readAdjustConfigSafe_(ss);
+  
+  // Clear llm_processed flag in all source sheets
+  let clearedCount = 0;
+  ss.getSheets().forEach(sheet => {
+    const name = sheet.getName();
+    if (name.startsWith("Sweepza_") || name === CONFIG.SHEETS.MASTER) return;
+    
+    try {
+      const headerRow = 1;
+      const idx = resolveSourceIdx_(sheet, adjust, headerRow);
+      
+      if (idx.llmProcessed > -1) {
+        const lastRow = sheet.getLastRow();
+        if (lastRow > headerRow) {
+          sheet.getRange(headerRow + 1, idx.llmProcessed + 1, lastRow - headerRow, 1).clearContent();
+          clearedCount++;
+        }
+      }
+    } catch (e) {
+      // Skip sheets without llm_processed column
+    }
+  });
+  
+  ui.alert(`LLM cache cleared!\n\nCleared llm_processed flags in ${clearedCount} sheet(s).\n\nNext pipeline run will re-enrich all rows.`);
+}
+
+/**
+ * Export Master sheet to CSV file
+ */
+function exportMasterToCsv() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const master = ss.getSheetByName(CONFIG.SHEETS.MASTER);
+  
+  if (!master || master.getLastRow() < 2) {
+    SpreadsheetApp.getUi().alert("Master sheet is empty. Run sweepzaPipeline() first.");
+    return;
+  }
+  
+  const fileName = `Sweepza_Master_Export_${Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "yyyy-MM-dd_HHmmss")}.csv`;
+  const csvData = master.getDataRange().getValues();
+  const csv = csvData.map(row => row.map(cell => {
+    const str = String(cell || "");
+    // Escape quotes and wrap in quotes if contains comma, quote, or newline
+    if (str.indexOf(',') !== -1 || str.indexOf('"') !== -1 || str.indexOf('\n') !== -1) {
+      return '"' + str.replace(/"/g, '""') + '"';
+    }
+    return str;
+  }).join(',')).join('\n');
+  
+  const blob = Utilities.newBlob(csv, 'text/csv', fileName);
+  
+  // Save to Drive in same folder as spreadsheet
+  const ssFile = DriveApp.getFileById(CONFIG.SPREADSHEET_ID);
+  const folder = ssFile.getParents().hasNext() ? ssFile.getParents().next() : DriveApp.getRootFolder();
+  const file = folder.createFile(blob);
+  
+  SpreadsheetApp.getUi().alert(
+    "Export Complete!",
+    `Master sheet exported to:\n${file.getName()}\n\nLocation: ${folder.getName()}\n\nRows: ${csvData.length - 1}`,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+/**
+ * Update system status metrics in Control Panel
+ */
+function updateControlPanelStatus_() {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const control = ss.getSheetByName(CONFIG.SHEETS.CONTROL);
+    if (!control) return;
+    
+    // Last Pipeline Run
+    const runHistory = ss.getSheetByName(CONFIG.SHEETS.RUNS);
+    if (runHistory && runHistory.getLastRow() >= 2) {
+      const lastRun = runHistory.getRange(runHistory.getLastRow(), 1, 1, 2).getValues()[0];
+      control.getRange("B17").setValue(lastRun[0]); // Timestamp
+      control.getRange("C17").setValue(lastRun[0]);
+    }
+    
+    // Enabled Source Sheets
+    const sourceMap = ss.getSheetByName(CONFIG.SHEETS.SOURCE_MAP);
+    if (sourceMap && sourceMap.getLastRow() >= 2) {
+      const enabled = sourceMap.getRange(2, 2, sourceMap.getLastRow() - 1, 1).getValues().filter(r => toBool_(r[0])).length;
+      control.getRange("B18").setValue(enabled);
+      control.getRange("C18").setValue(new Date());
+    }
+    
+    // Master Export Rows
+    const master = ss.getSheetByName(CONFIG.SHEETS.MASTER);
+    if (master) {
+      const rows = Math.max(0, master.getLastRow() - 1);
+      control.getRange("B19").setValue(rows);
+      control.getRange("C19").setValue(new Date());
+    }
+    
+    // LLM Queue Size (rows without llm_processed)
+    // This is expensive, skip for now or make async
+    control.getRange("B20").setValue("N/A");
+    control.getRange("C20").setValue("");
+    
+  } catch (e) {
+    // Silent fail - status update is non-critical
+  }
 }
 
 /** ========================================================================
@@ -1208,8 +1508,11 @@ function stage2_llmEnrich_(sourceSheets, logSheet, runStartMs, adjust, headerRow
       const fpHash = HashUtils.sha256Base64_(fingerprint);
       const existingHash = idx.llmHash > -1 ? String(row[idx.llmHash] || "") : "";
 
-      // If changed, re-run LLM
-      if (!alreadyProcessed || existingHash !== fpHash) {
+      // FORCE_FULL_REFRESH: ignore llm_processed flag, reprocess all rows
+      const forceRefresh = !!settings.forceFullRefresh;
+      
+      // If changed, re-run LLM (or if force refresh enabled)
+      if (forceRefresh || !alreadyProcessed || existingHash !== fpHash) {
         candidates.push({ i, fpHash, payload: { title, desc, eligibility, entryLimit, numPrizes, image }, entry });
       }
     }
